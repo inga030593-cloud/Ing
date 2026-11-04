@@ -1,0 +1,4944 @@
+/* ============================================================================
+   SIRI AI CLOUD — ВЕСЬ ИСХОДНЫЙ КОД ОТ А ДО Я
+   Siri 6.0 Cyclone · Siri 7.0 Astra · Siri Super Coder · Siri 6.9 Vision
+   + Смит (AI Group) · интернет-поиск · режим Live · движок Lightning
+   Снимок: 5 ноября 2026
+
+   Здесь всё приложение целиком, по порядку и без разбивки на части:
+   точка входа → страницы и маршруты → работа с облаком, моделями,
+   поиском в интернете и защитой → оформление → браузерные скрипты → значки.
+
+   Каждый файл отмечен заголовком. Служебный модуль доступа к платформе
+   (src/pipe.js) выдаётся платформой и в этот файл не входит. Этот снимок
+   собирается скриптом в конце файла, он же создаёт страницу /source/full.
+   ============================================================================ */
+
+
+
+/* ==================== [01/25] package.json ==================== */
+
+
+{"type":"module","private":true,"dependencies":{"hono":"^4.6.0"}}
+
+/* ==================== [02/25] entry.mjs ==================== */
+
+
+import { handle } from "hono/aws-lambda";
+import { timingSafeEqual } from "node:crypto";
+import app from "./src/index.js";
+import { _bindVisitor, _mintedRealtimeToken } from "./src/pipe.js";
+app.onError((err, c) => {
+  if (String(err?.message) === "rate_limited") return c.json({ error: "rate_limited" }, 429);
+  console.error(err);
+  return c.text("Internal Server Error", 500);
+});
+const _inner = handle(app);
+function _eq(a, b) {
+  const x = Buffer.from(String(a ?? "")), y = Buffer.from(String(b ?? ""));
+  return x.length === y.length && timingSafeEqual(x, y);
+}
+// cf-connecting-ip first; else last X-Forwarded-For hop (closest trusted).
+function _realIp(h) {
+  if (h["cf-connecting-ip"]) return String(h["cf-connecting-ip"]).trim();
+  const fwd = h["x-forwarded-for"];
+  if (!fwd) return "";
+  const parts = String(fwd).split(",");
+  return parts[parts.length - 1].trim();
+}
+function _cache(event, res, authed) {
+  if (!res) return res;
+  const headers = res.headers || (res.headers = {});
+  // A realtime token lives an hour: whatever carries one is never edge-cached, whatever the app declared.
+  if (_mintedRealtimeToken()) {
+    for (const k of Object.keys(headers)) if (k.toLowerCase() === "cache-control") delete headers[k];
+    headers["cache-control"] = "private, no-store";
+    return res;
+  }
+  if (event?.requestContext?.http?.method !== "GET") return res;
+  if (Object.keys(headers).some((k) => k.toLowerCase() === "cache-control")) return res;
+  // Cookie / Set-Cookie / restored Authorization → private; else edge-cacheable.
+  const priv = !!event.headers?.cookie || (Array.isArray(res.cookies) && res.cookies.length > 0) || authed;
+  headers["cache-control"] = res.statusCode === 200 && !priv ? "public, max-age=0, must-revalidate, s-maxage=86400" : "private, no-store";
+  return res;
+}
+export const handler = async (event, context) => {
+  const h = event?.headers || {};
+  const edgeOk = _eq(h["x-edge-key"], process.env.EDGE_KEY);
+  const serverOk = _eq(h["x-origin-secret"], process.env.PIPE_ORIGIN_SECRET) && _eq(h["x-pipe-key"], process.env.PIPE_KEY);
+  if (!edgeOk && !serverOk) return { statusCode: 403, headers: { "content-type": "text/plain" }, body: "forbidden" };
+  // SigV4 proxy overwrites Authorization; nginx stashed the visitor value as X-Original-Authorization.
+  const authed = !!h["x-original-authorization"];
+  if (authed) h["authorization"] = h["x-original-authorization"];
+  else delete h["authorization"];
+  for (const k of ["x-original-authorization", "x-edge-key", "x-amz-security-token", "x-amz-date", "x-amz-content-sha256"]) delete h[k];
+  // POST keeps origin/pipe headers for pipe.isScheduler(); GET strips them for cache safety.
+  if (event?.requestContext?.http?.method !== "POST") { delete h["x-origin-secret"]; delete h["x-pipe-key"]; }
+  _bindVisitor(_realIp(h));
+  return _cache(event, await _inner(event, context), authed);
+};
+
+/* ==================== [03/25] src/index.js ==================== */
+
+
+import { Hono } from "hono";
+import { Layout } from "./layout.js";
+import { RegisterPages } from "./routes/pages.js";
+import { RegisterSourcePages } from "./routes/source.js";
+import { RegisterApi } from "./routes/api.js";
+import { RegisterTools } from "./routes/tools.js";
+import { RegisterAccountPages } from "./routes/account.js";
+import pipe from "./pipe.js";
+
+const app = new Hono();
+
+RegisterApi(app);
+RegisterTools(app);
+RegisterAccountPages(app);
+RegisterSourcePages(app);
+RegisterPages(app);
+
+app.notFound((c) =>
+  c.html(
+    <Layout
+      title="Страница не найдена — Siri AI"
+      description="Такой страницы нет. Вернитесь в облачный чат Siri AI и продолжите диалог."
+      path="/404"
+      origin={pipe.origin(c.req)}
+      noindex
+    >
+      <div class="notfound">
+        <span class="logo rainbow-text">Siri</span>
+        <h1>Страница не найдена</h1>
+        <p>Похоже, этот адрес не существует. Облачный чат ждёт тебя на главной.</p>
+        <a class="home-link" href="/">Открыть Siri</a>
+      </div>
+    </Layout>,
+    404,
+  ),
+);
+
+export default app;
+
+/* ==================== [04/25] src/layout.js ==================== */
+
+
+import { raw } from "hono/html";
+import pipe from "./pipe.js";
+
+export function Layout({ title, description, path = "/", origin, noindex = false, children }) {
+  const url = origin + path;
+  const ld = {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    name: "Siri AI",
+    url,
+    applicationCategory: "UtilitiesApplication",
+    operatingSystem: "Any",
+    description,
+    offers: { "@type": "Offer", price: "0", priceCurrency: "RUB" },
+    publisher: { "@type": "Organization", name: "Imagination Technology" },
+  };
+  return (
+    <>
+      {raw("<!DOCTYPE html>")}
+      <html lang="ru">
+        <head>
+          <meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <title>{title}</title>
+          <meta name="description" content={description} />
+          <link rel="canonical" href={url} />
+          {noindex ? <meta name="robots" content="noindex" /> : null}
+          <meta property="og:type" content="website" />
+          <meta property="og:title" content={title} />
+          <meta property="og:description" content={description} />
+          <meta property="og:url" content={url} />
+          <meta property="og:image" content={pipe.cover()} />
+          <meta property="og:site_name" content="Siri AI" />
+          <meta name="twitter:card" content="summary_large_image" />
+          <meta name="twitter:title" content={title} />
+          <meta name="twitter:description" content={description} />
+          <meta name="twitter:image" content={pipe.cover()} />
+          <meta name="theme-color" content="#0a0a12" />
+          <link rel="icon" type="image/svg+xml" href={pipe.media("favicon.svg")} />
+          <link rel="apple-touch-icon" sizes="180x180" href={pipe.media("img/apple-touch-icon.png")} />
+          <link rel="manifest" href="/manifest.webmanifest" />
+          <meta name="apple-mobile-web-app-capable" content="yes" />
+          <meta name="mobile-web-app-capable" content="yes" />
+          <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+          <meta name="apple-mobile-web-app-title" content="Siri AI" />
+          <meta name="application-name" content="Siri AI" />
+          <link rel="stylesheet" href={pipe.asset("css/site.css")} />
+          <script
+            type="application/ld+json"
+            dangerouslySetInnerHTML={{ __html: JSON.stringify(ld).replace(/</g, "\\u003c") }}
+          />
+        </head>
+        <body>{children}</body>
+      </html>
+    </>
+  );
+}
+
+/* ==================== [05/25] src/routes/pages.js ==================== */
+
+/* ============================================================================
+   Главная страница — новый интерфейс в стиле ChatGPT (как на референсе):
+   чёрный фон, круглые кнопки, карточка приветствия с градиентом,
+   пилюли-подсказки и плавающий композер с «+», полем и микрофоном.
+   ============================================================================ */
+
+import { Layout } from "../layout.js";
+import pipe from "../pipe.js";
+import { MODEL_CHOICES, CONTEXT_CHOICES } from "../lib/cloud.js";
+import { currentUser, displayName } from "../lib/auth.js";
+import { ensureTelegram } from "../lib/telegram.js";
+import { noStore } from "../lib/visitor.js";
+
+const SUGGESTIONS = [
+  "Поищи в интернете, что такое айфон 14 про",
+  "Объясни квантовую запутанность простыми словами",
+  "Составь план продуктивной недели",
+  "Сири и Смит, как вы?",
+];
+
+function ChatPage({ origin, user }) {
+  const initial = user ? displayName(user).slice(0, 1).toUpperCase() : "";
+  return (
+    <Layout
+      title="Siri AI — облачный ИИ-ассистент для всех"
+      description="Siri AI работает в облаке и открыта для всех: диалоги, режим AI Group со Смитом, интернет-поиск и голосовой режим Live. Регистрация по Email — по желанию."
+      path="/"
+      origin={origin}
+    >
+      <div class="app">
+        {/* Фон рисует движок Lightning (WebGPU → Metal, фолбэк WebGL 2.0) */}
+        <canvas id="bgCanvas" aria-hidden="true"></canvas>
+
+        <aside class="sidebar" id="sidebar" aria-label="Мои чаты">
+          <div class="side-head">
+            <span class="logo rainbow-text">🧠 Siri</span>
+            <button class="icon-btn side-close" id="closeSidebar" type="button" aria-label="Закрыть список чатов">
+              ✕
+            </button>
+          </div>
+
+          {/* Выбор режима: AI Group, Siri или Smith — сверху бокового меню */}
+          <div class="mode-switch" id="modeSwitch" role="tablist" aria-label="Режим ассистента">
+            <button class="mode-btn" id="modeGroup" type="button" role="tab" aria-selected="false" data-mode="group">
+              <span aria-hidden="true">👥</span> AI Group
+            </button>
+            <button class="mode-btn" id="modeSiri" type="button" role="tab" aria-selected="true" data-mode="siri">
+              <span aria-hidden="true">🧠</span> Siri
+            </button>
+            <button class="mode-btn" id="modeSmith" type="button" role="tab" aria-selected="false" data-mode="smith">
+              <span aria-hidden="true">🎩</span> Smith
+            </button>
+          </div>
+
+          <button class="new-chat" id="newChat" type="button">
+            <span aria-hidden="true">✎</span> Новый чат
+          </button>
+          <label class="side-search">
+            <span class="sr-only">Поиск по чатам</span>
+            <input id="chatSearch" type="search" placeholder="Поиск по чатам" autocomplete="off" />
+          </label>
+          <div class="chat-list" id="chatList">
+            <p class="chat-empty">Пока нет чатов. Напиши первое сообщение.</p>
+          </div>
+          <div class="side-foot">
+            <span class="dot" aria-hidden="true"></span> Облако · открыто для всех
+          </div>
+        </aside>
+
+        <div class="scrim" id="scrim" hidden></div>
+
+        <div class="main">
+          <header class="topbar">
+            <button class="icon-btn" id="openSidebar" type="button" aria-label="Открыть чаты">☰</button>
+            <button class="icon-btn" id="topNewChat" type="button" aria-label="Новый чат" title="Новый чат">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+            </button>
+            <div class="brand">
+              <span class="logo rainbow-text">Siri</span>
+              <span class="model-pill" id="modelPill">6.0 Cyclone</span>
+            </div>
+            <div class="top-actions">
+              <button class="icon-btn" id="searchBtn" type="button" aria-label="Поиск по чатам" title="Поиск по чатам">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+              </button>
+              <button class="icon-btn" id="themeBtn" type="button" aria-label="Сменить тему" title="Сменить тему">◐</button>
+              <button class="icon-btn" id="settingsBtn" type="button" aria-label="Настройки" title="Настройки">⚙</button>
+            </div>
+          </header>
+
+          <main class="chat" id="chat">
+            <section class="welcome" id="welcome">
+              <div class="orb" aria-hidden="true"></div>
+              <h1>
+                Siri теперь <span class="rainbow-text">в облаке</span>
+              </h1>
+              <p>
+                Тот же ассистент, но без установки и запуска: открой ссылку с любого устройства и общайся.
+                Попроси Siri поискать что-нибудь в интернете, открой режим AI Group, чтобы общались Siri и
+                Смит, или нажми микрофон и говори голосом в режиме Live.
+              </p>
+              <div class="suggestions">
+                {SUGGESTIONS.map((text) => (
+                  <button class="suggestion" type="button" data-prompt={text}>
+                    {text}
+                  </button>
+                ))}
+              </div>
+            </section>
+            <div class="messages" id="messages" aria-live="polite"></div>
+          </main>
+
+          {/* Кнопка «вниз» — как у других ИИ, когда прокрутил далеко от конца */}
+          <button class="jump-down" id="jumpDown" type="button" aria-label="Прокрутить вниз" hidden>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="m5 12 7 7 7-7"/></svg>
+          </button>
+
+          <form class="composer" id="composer" autocomplete="off">
+            {/* Ответ на конкретное сообщение: без жестов, только кнопкой «Ответить» */}
+            <div class="reply-chip" id="replyChip" hidden>
+              <span id="replyText"></span>
+              <button type="button" id="replyCancel" aria-label="Отменить ответ">✕</button>
+            </div>
+            <div class="composer-inner">
+              <button class="plus-btn" id="plusBtn" type="button" aria-label="Ещё" title="Поиск в интернете">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+              </button>
+              <textarea
+                id="input"
+                rows="1"
+                maxlength="4000"
+                placeholder="Спроси Siri"
+                aria-label="Сообщение для Siri"
+              ></textarea>
+              <button class="mic-btn" id="micBtn" type="button" aria-label="Голосовой режим Live" title="Режим Live">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><path d="M12 18v4"/></svg>
+              </button>
+              <button class="send" id="send" type="submit" aria-label="Отправить">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m3.4 20.4 17.5-7.5a1 1 0 0 0 0-1.8L3.4 3.6a.9.9 0 0 0-1.3 1l1.8 6.3c.1.4.5.7.9.7l9.7 1.4-9.7 1.4c-.4 0-.8.3-.9.7l-1.8 6.3c-.2.7.5 1.3 1.3 1Z"/></svg>
+              </button>
+            </div>
+          </form>
+
+          {/* Оверлей голосового режима Live */}
+          <div class="live-overlay" id="liveOverlay" hidden>
+            <div class="live-orb" id="liveOrb" aria-hidden="true"></div>
+            <div class="live-text" id="liveText">Слушаю… говорите</div>
+            <div class="live-sub">Нажмите, чтобы остановить режим Live</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal" id="settingsModal" hidden>
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+          <button class="icon-btn modal-close" id="settingsClose" type="button" aria-label="Закрыть">✕</button>
+          <h2 id="settingsTitle">Настройки</h2>
+
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Светлая тема</div>
+              <p class="setting-desc">Переключить оформление интерфейса.</p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="themeSwitch" />
+              <span class="switch-track" aria-hidden="true"></span>
+            </label>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Крупный текст</div>
+              <p class="setting-desc">Увеличить размер сообщений в диалоге.</p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="fontSwitch" />
+              <span class="switch-track" aria-hidden="true"></span>
+            </label>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Модель</div>
+              <p class="setting-desc">Выбор модели Siri: Cyclone, Astra, Super Coder или Vision.</p>
+            </div>
+            <label class="select-wrap">
+              <span class="sr-only">Модель</span>
+              <select class="setting-select" id="modelSelect" aria-label="Выбор модели Siri">
+                {MODEL_CHOICES.map((item) => (
+                  <option value={item.key}>{item.label}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Контекст</div>
+              <p class="setting-desc">Сколько токенов истории диалога модели видят в каждом запросе.</p>
+            </div>
+            <label class="select-wrap">
+              <span class="sr-only">Размер контекста</span>
+              <select class="setting-select" id="contextSelect" aria-label="Размер контекста">
+                {CONTEXT_CHOICES.map((item) => (
+                  <option value={item.key}>{item.label}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Скорость печати</div>
+              <p class="setting-desc">Медленный поток ответа — как у GPT, текст появляется спокойно.</p>
+            </div>
+            <label class="select-wrap">
+              <span class="sr-only">Скорость печати</span>
+              <select class="setting-select" id="speedSelect" aria-label="Скорость печати">
+                <option value="slow">Медленно (как GPT)</option>
+                <option value="medium">Средне</option>
+                <option value="fast">Быстро</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Lightning API</div>
+              <p class="setting-desc">
+                Собственная разработка Imagination Technology: графический движок на Metal через WebGPU
+                с фолбэком на WebGL 2.0. Отвечает за анимированный фон и эффекты. Выключите, чтобы
+                сэкономить заряд батареи.
+              </p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="lightningSwitch" />
+              <span class="switch-track" aria-hidden="true"></span>
+            </label>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Режим Live</div>
+              <p class="setting-desc">
+                Голосовой режим: Siri слушает микрофон и отвечает голосом. Работает и на iPhone.
+                Кнопка микрофона в поле ввода включает и выключает его.
+              </p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="liveSwitch" />
+              <span class="switch-track" aria-hidden="true"></span>
+            </label>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Персонализированная память</div>
+              <p class="setting-desc">
+                Расскажите о себе: имя, чем занимаетесь, что вам нравится. Siri и Смит будут учитывать
+                это в каждом ответе — как персональная память у GPT.
+              </p>
+            </div>
+          </div>
+          <div class="bio-row">
+            <label class="sr-only" for="bioText">Ваша биография</label>
+            <textarea
+              id="bioText"
+              maxlength="4000"
+              placeholder="Например: меня зовут Алекс, я из Амстердама, разрабатываю приложения для iOS, люблю футбол и джаз…"
+            ></textarea>
+            <button class="mini-btn" id="bioSave" type="button">Сохранить память</button>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Режим защиты от кибер-атак</div>
+              <p class="setting-desc" id="shieldStatus">
+                Проверяет сообщения на вредоносный код, взлом запросов и перегрузку. При включении
+                подозрительные сообщения блокируются, а нарушитель — на 15 минут.
+              </p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="shieldSwitch" />
+              <span class="switch-track" aria-hidden="true"></span>
+            </label>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Telegram-бот</div>
+              <p class="setting-desc">
+                @Siri_Ai_Imagination_bot включён и отвечает в Telegram как Siri.{" "}
+                <a class="tg-link" href="https://t.me/Siri_Ai_Imagination_bot" target="_blank" rel="noopener">
+                  Открыть бота
+                </a>
+              </p>
+            </div>
+            <span class="on-pill"><span class="dot" aria-hidden="true"></span>Включён</span>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">{user ? displayName(user) : "Аккаунт по Email"}</div>
+              <p class="setting-desc">
+                {user
+                  ? user.data.email
+                  : "Зарегистрируйтесь, чтобы история чатов открывалась на любом устройстве."}
+              </p>
+            </div>
+            {user ? (
+              <form method="post" action="/logout">
+                <button class="mini-btn" type="submit">Выйти</button>
+              </form>
+            ) : (
+              <a class="mini-btn" href="/signup">Регистрация</a>
+            )}
+          </div>
+
+          <div class="about">
+            <strong>Siri и Смит · AI Group</strong>
+            <p>
+              Выберите режим в боковом меню: Siri, Смит или AI Group, где они общаются вместе. Позвать
+              ассистента можно по имени: «Сири, как ты?» — ответит Siri, «Сири и Смит, как вы?» — обе.
+              Модель, контекст и скорость печати меняются в этих настройках.{" "}
+              <a class="tg-link" href="/source">Исходный код</a>
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div class="toast" id="toast" role="status" hidden></div>
+      <script src={pipe.asset("js/lightning.js")} defer></script>
+      <script src={pipe.asset("js/app.js")} defer></script>
+    </Layout>
+  );
+}
+
+export function RegisterPages(app) {
+  app.get("/", async (c) => {
+    noStore(c);
+    const origin = pipe.origin(c.req);
+    const [user] = await Promise.all([currentUser(c), ensureTelegram(origin)]);
+    return c.html(<ChatPage origin={origin} user={user} />);
+  });
+
+  app.get("/manifest.webmanifest", (c) => {
+    const icon = pipe.media("img/siri-icon.png");
+    const icon192 = pipe.media("img/siri-icon-192.png");
+    return c.body(
+      JSON.stringify({
+        name: "Siri AI",
+        short_name: "Siri",
+        description: "Облачный ИИ-ассистент Siri: диалоги, режим AI Group со Смитом, интернет-поиск и голосовой режим Live.",
+        lang: "ru",
+        start_url: "/",
+        scope: "/",
+        display: "standalone",
+        background_color: "#050508",
+        theme_color: "#050508",
+        icons: [
+          { src: icon192, sizes: "192x192", type: "image/png", purpose: "any" },
+          { src: icon, sizes: "512x512", type: "image/png", purpose: "any" },
+        ],
+      }),
+      200,
+      { "content-type": "application/manifest+json; charset=utf-8" },
+    );
+  });
+
+  app.get("/robots.txt", (c) =>
+    c.text(`User-agent: *\nAllow: /\nSitemap: ${pipe.origin(c.req)}/sitemap.xml\n`),
+  );
+
+  app.get("/sitemap.xml", (c) => {
+    const origin = pipe.origin(c.req);
+    return c.body(
+      `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>${origin}/</loc></url><url><loc>${origin}/source</loc></url></urlset>`,
+      200,
+      { "content-type": "application/xml" },
+    );
+  });
+}
+
+/* ==================== [06/25] src/routes/api.js ==================== */
+
+/* ============================================================================
+   API чата. Один POST /api/chat делает весь ход:
+   определяет, кто отвечает (Siri / Smith / обе), при просьбе ходит в интернет,
+   стримит ответы по SSE и сохраняет их. Генерации картинок больше нет.
+   ============================================================================ */
+
+import pipe from "../pipe.js";
+import { noStore } from "../lib/visitor.js";
+import { streamCloud, trimHistory, buildSystem, buildMessages, CONTEXT_CHOICES } from "../lib/cloud.js";
+import { identity, isMine, ownChat, ownerFields, ownerWhere, ID_RE } from "../lib/access.js";
+import { getSettings } from "../lib/settings.js";
+import { inspectText, noteAttack, securityState, shieldRateExceeded } from "../lib/security.js";
+import { PERSONAS, resolveSpeakers, wantsDiscussion } from "../lib/persona.js";
+import { wantsSearch, searchQuery, searchWeb } from "../lib/search.js";
+
+const HOUR = 60 * 60 * 1000;
+const MAX_PER_HOUR = 120;
+// Групповой диалог Смит ↔ Сири: максимум 2 раунда обмена репликами сверх ответов.
+const MAX_GROUP_ROUNDS = 2;
+
+function cleanTitle(text) {
+  const t = text.replace(/\s+/g, " ").trim();
+  return t.length > 48 ? `${t.slice(0, 48).trim()}…` : t || "Новый чат";
+}
+
+function unavailable(c) {
+  return c.json({ error: "unavailable" }, 503);
+}
+
+function contextTokens(choice) {
+  const found = CONTEXT_CHOICES.find((item) => item.key === choice);
+  return found ? found.tokens : 1_000_000;
+}
+
+// Память между чатами: строки из других разговоров плюс оценки ответов.
+function buildMemory(rows, chatId) {
+  const past = rows.filter((m) => m.data.chat_id !== chatId && m.data.kind !== "image" && m.data.text);
+  const memory = past
+    .slice(0, 8)
+    .reverse()
+    .map((m) => {
+      const who = m.data.role === "ai" ? (PERSONAS[m.data.who]?.name || "Siri") : "Пользователь";
+      return `- ${who}: ${String(m.data.text).replace(/\s+/g, " ").slice(0, 160)}`;
+    });
+  const rated = rows.filter((m) => m.data.role === "ai" && m.data.rating);
+  const liked = rated.filter((m) => m.data.rating === "up").slice(0, 2);
+  const disliked = rated.filter((m) => m.data.rating === "down").slice(0, 2);
+  return {
+    memory: memory.join("\n"),
+    liked: liked.map((m) => String(m.data.text).replace(/\s+/g, " ").slice(0, 220)).join("\n---\n"),
+    disliked: disliked.map((m) => String(m.data.text).replace(/\s+/g, " ").slice(0, 220)).join("\n---\n"),
+  };
+}
+
+async function shieldCheck(c, who, text) {
+  const settings = await getSettings(who);
+  if (!settings.shield) return null;
+  const state = await securityState(who);
+  if (state.blockedUntil > Date.now()) {
+    return c.json({ error: "shield_blocked", retry_after: Math.ceil((state.blockedUntil - Date.now()) / 1000) }, 403);
+  }
+  const reason = inspectText(text);
+  if (reason) {
+    const next = await noteAttack(who, reason);
+    return c.json(
+      { error: "shield_blocked", retry_after: next.blockedUntil ? Math.ceil((next.blockedUntil - Date.now()) / 1000) : 0 },
+      403,
+    );
+  }
+  if (await shieldRateExceeded(who)) return c.json({ error: "shield_rate_limited" }, 429);
+  return null;
+}
+
+export function RegisterApi(app) {
+  app.get("/api/chats", async (c) => {
+    noStore(c);
+    const who = await identity(c);
+    const where = ownerWhere(who);
+    let chats = await pipe.data.list("chats", {
+      where,
+      sort: "updated_at",
+      order: "desc",
+      limit: 50,
+    });
+    if (!who.user) chats = chats.filter((ch) => !ch.data.user_id);
+    return c.json({
+      chats: chats.map((ch) => ({
+        id: ch._id,
+        title: ch.data.title,
+        preview: ch.data.preview || "",
+        mode: ch.data.mode || "siri",
+        updated_at: ch.data.updated_at,
+      })),
+    });
+  });
+
+  app.get("/api/chats/:id", async (c) => {
+    noStore(c);
+    const who = await identity(c);
+    const chat = await ownChat(c, who);
+    if (!chat) return c.json({ error: "not_found" }, 404);
+    const page = await pipe.data.list("messages", {
+      where: { chat_id: chat._id },
+      sort: "created_at",
+      order: "desc",
+      limit: 200,
+    });
+    const messages = page
+      .slice()
+      .reverse()
+      .map((m) => ({
+        id: m._id,
+        role: m.data.role,
+        who: m.data.who || "siri",
+        text: m.data.text,
+        rating: m.data.rating || "",
+        sources: m.data.sources || [],
+        reply_to: m.data.reply_to || "",
+        created_at: m.data.created_at,
+      }));
+    return c.json({ chat: { id: chat._id, title: chat.data.title, mode: chat.data.mode || "siri" }, messages });
+  });
+
+  app.delete("/api/chats/:id", async (c) => {
+    noStore(c);
+    const who = await identity(c);
+    const chat = await ownChat(c, who);
+    if (!chat) return c.json({ error: "not_found" }, 404);
+    try {
+      for (;;) {
+        const batch = await pipe.data.list("messages", {
+          where: { chat_id: chat._id },
+          limit: 100,
+        });
+        if (!batch.length) break;
+        for (const m of batch) await pipe.data.remove("messages", m._id);
+        if (batch.length < 100) break;
+      }
+      await pipe.data.remove("chats", chat._id);
+    } catch (e) {
+      if (["quota_exceeded", "rate_limited"].includes(e.message)) return unavailable(c);
+      throw e;
+    }
+    return c.json({ ok: true });
+  });
+
+  app.post("/api/chat", async (c) => {
+    noStore(c);
+    const who = await identity(c);
+    const body = await c.req.json().catch(() => null);
+    const text = typeof body?.text === "string" ? body.text.trim() : "";
+    if (!text) return c.json({ error: "empty" }, 400);
+    if (text.length > 4000) return c.json({ error: "too_long" }, 400);
+    const model = typeof body?.model === "string" ? body.model : "cyclone";
+    const mode = ["siri", "smith", "group"].includes(body?.mode) ? body.mode : "siri";
+    // Ответ на конкретное сообщение (кнопка «Ответить»): цитата уходит в промпт.
+    const replyQuote =
+      typeof body?.reply_to === "string" ? body.reply_to.replace(/\s+/g, " ").slice(0, 500) : "";
+
+    const blocked = await shieldCheck(c, who, text);
+    if (blocked) return blocked;
+
+    const now = Date.now();
+    const wantedId = typeof body.chat_id === "string" ? body.chat_id : "";
+    if (wantedId && !ID_RE.test(wantedId)) return c.json({ error: "not_found" }, 404);
+
+    const [recent, found, settings] = await Promise.all([
+      pipe.data
+        .count("messages", { where: { ...ownerWhere(who), created_at: { $gt: now - HOUR } } })
+        .catch(() => 0),
+      wantedId ? pipe.data.get("chats", wantedId) : Promise.resolve(null),
+      getSettings(who),
+    ]);
+    if (recent >= MAX_PER_HOUR) return c.json({ error: "rate_limited" }, 429);
+    if (wantedId && !isMine(found, who)) return c.json({ error: "not_found" }, 404);
+    let chat = wantedId ? found : null;
+
+    const owner = ownerFields(who);
+    try {
+      if (!chat) {
+        chat = await pipe.data.insert("chats", {
+          ...owner,
+          title: cleanTitle(text),
+          preview: "",
+          mode,
+          created_at: now,
+          updated_at: now,
+        });
+      }
+      await pipe.data.insert("messages", {
+        chat_id: chat._id,
+        ...owner,
+        role: "user",
+        kind: "text",
+        text,
+        reply_to: replyQuote,
+        created_at: now,
+      });
+    } catch (e) {
+      if (["quota_exceeded", "rate_limited"].includes(e.message)) return unavailable(c);
+      throw e;
+    }
+
+    const chatId = chat._id;
+    const chatMode = chat.data.mode || mode;
+
+    // История чата и память между чатами не зависят друг от друга — читаем вместе.
+    const [page, memoryRows] = await Promise.all([
+      pipe.data
+        .list("messages", {
+          where: { chat_id: chatId },
+          sort: "created_at",
+          order: "desc",
+          limit: 200,
+        })
+        .catch(() => []),
+      pipe.data
+        .list("messages", { where: ownerWhere(who), sort: "created_at", order: "desc", limit: 40 })
+        .catch(() => []),
+    ]);
+
+    const budget = contextTokens(settings.context);
+    const context = buildMemory(memoryRows, chatId);
+    // Бюджет контекста из настроек применяется по-настоящему: лишняя история отрезается.
+    const history = trimHistory(
+      page
+        .slice()
+        .reverse()
+        .map((m) => ({
+          role: m.data.role === "ai" ? "assistant" : "user",
+          who: m.data.who || "siri",
+          content: String(m.data.text || ""),
+        })),
+      budget,
+    );
+
+    const speakers = resolveSpeakers(text, chatMode);
+    const group = chatMode === "group" || speakers.length > 1;
+    const doSearch = wantsSearch(text);
+
+    const encoder = new TextEncoder();
+    const replyStream = new ReadableStream({
+      async start(controller) {
+        const send = (event) => {
+          try {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          } catch {
+            /* посетитель закрыл страницу */
+          }
+        };
+        send({ type: "start", chat: { id: chatId, title: chat.data.title, mode: chatMode }, speakers, search: doSearch });
+
+        // Интернет-поиск: собираем источники до обращения к модели.
+        let search = null;
+        if (doSearch) {
+          send({ type: "status", text: "Ищу в интернете…" });
+          search = await searchWeb(searchQuery(text) || text);
+          send({ type: "sources", sources: search.results, query: search.query });
+        }
+
+        // Один общий список «виртуальной истории»: сюда добавляются свежие реплики,
+        // поэтому Смит видит ответ Сиры, а Сири — ответ Смита.
+        const script = history.slice();
+
+        const answer = async (personaKey) => {
+          const persona = PERSONAS[personaKey];
+          send({ type: "who", who: personaKey, name: persona.name });
+          const system = buildSystem({
+            personaKey,
+            group,
+            bio: settings.bio,
+            memory: context.memory,
+            liked: context.liked,
+            disliked: context.disliked,
+            search,
+          });
+          let messages = buildMessages({ history: script, personaKey, group });
+          if (replyQuote) {
+            messages = [
+              ...messages,
+              { role: "user", content: `(Пользователь отвечает на сообщение: «${replyQuote}»)\n${text}` },
+            ];
+          }
+          const outgoing = [{ role: "system", content: system }, ...messages];
+
+          let stream;
+          try {
+            stream = await streamCloud(outgoing, model);
+          } catch {
+            stream = { error: "upstream" };
+          }
+          if (stream.error) {
+            send({ type: "error", who: personaKey, error: "cloud_unavailable" });
+            return "";
+          }
+
+          let full = "";
+          try {
+            for await (const delta of stream.deltas) {
+              full += delta;
+              send({ type: "delta", who: personaKey, text: delta });
+            }
+          } catch {
+            /* поток оборвался — сохраняем то, что пришло */
+          }
+          full = full.trim();
+          if (!full) {
+            send({ type: "error", who: personaKey, error: "cloud_unavailable" });
+            return "";
+          }
+
+          script.push({ role: "assistant", who: personaKey, content: full });
+          try {
+            const reply = await pipe.data.insert("messages", {
+              chat_id: chatId,
+              ...owner,
+              role: "ai",
+              kind: "text",
+              who: personaKey,
+              text: full,
+              sources: search?.results || [],
+              created_at: Date.now(),
+            });
+            send({ type: "saved", who: personaKey, reply: { id: reply._id, who: personaKey, text: full, sources: search?.results || [] } });
+          } catch {
+            send({ type: "error", who: personaKey, error: "save_failed" });
+          }
+          return full;
+        };
+
+        // Основные ответы: Siri и/или Смит по очереди.
+        for (const personaKey of speakers) {
+          await answer(personaKey);
+        }
+
+        // Просьба «поговорите о…» в AI Group: Смит и Сири обмениваются репликами.
+        if (group && wantsDiscussion(text)) {
+          let last = speakers[speakers.length - 1] || "siri";
+          for (let round = 0; round < MAX_GROUP_ROUNDS; round += 1) {
+            const next = last === "siri" ? "smith" : "siri";
+            const text2 = await answer(next);
+            if (!text2) break;
+            last = next;
+          }
+        }
+
+        try {
+          await pipe.data.update("chats", chatId, {
+            data: {
+              preview: (script[script.length - 1]?.content || text).replace(/\s+/g, " ").slice(0, 120),
+              updated_at: Date.now(),
+            },
+          });
+        } catch {
+          /* превью не критично */
+        }
+        send({ type: "done" });
+        controller.close();
+      },
+    });
+
+    return new Response(replyStream, {
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "private, no-store, no-transform",
+        "x-accel-buffering": "no",
+      },
+    });
+  });
+}
+
+/* ==================== [07/25] src/routes/tools.js ==================== */
+
+/* ============================================================================
+   Сервисные маршруты: настройки (включая биографию, контекст, Lightning),
+   оценки ответов, переименование и экспорт чатов, Telegram-бот.
+   ============================================================================ */
+
+import pipe from "../pipe.js";
+import { noStore } from "../lib/visitor.js";
+import { identity, isMine, ownChat, ID_RE } from "../lib/access.js";
+import { getSettings, saveSettings } from "../lib/settings.js";
+import { securityState } from "../lib/security.js";
+import { storedTelegramSecret, sameSecret, telegramToken, sendTelegram } from "../lib/telegram.js";
+import { askCloud, MODEL_CHOICES, CONTEXT_CHOICES } from "../lib/cloud.js";
+import { PERSONAS } from "../lib/persona.js";
+
+function unavailable(c) {
+  return c.json({ error: "unavailable" }, 503);
+}
+
+function settingsView(settings, security) {
+  return {
+    shield: !!settings.shield,
+    model: settings.model || "cyclone",
+    context: settings.context || "1m",
+    lightning: settings.lightning !== false,
+    bio: settings.bio || "",
+    stream_speed: settings.stream_speed || "slow",
+    strikes: security.strikes,
+    blocked_until: security.blockedUntil,
+  };
+}
+
+function safeFilename(title) {
+  const base = String(title || "chat").replace(/[^\p{L}\p{N}\-_ ]+/gu, "").replace(/\s+/g, "-").slice(0, 60);
+  return (base || "chat") + ".md";
+}
+
+function exportMarkdown(chat, messages) {
+  const mode = chat.data.mode === "group" ? "AI Group" : chat.data.mode === "smith" ? "Smith" : "Siri";
+  const lines = [`# ${chat.data.title}`, "", `Экспорт из Siri AI · Режим: ${mode} · ${new Date().toLocaleString("ru-RU")}`, ""];
+  for (const m of messages) {
+    const who =
+      m.data.role === "ai" ? (PERSONAS[m.data.who]?.name || "Siri") : "Вы";
+    lines.push(`**${who}:** ${m.data.text}`, "");
+    for (const source of m.data.sources || []) lines.push(`- Источник: ${source.url}`, "");
+  }
+  return lines.join("\n");
+}
+
+export function RegisterTools(app) {
+  app.get("/api/settings", async (c) => {
+    noStore(c);
+    const who = await identity(c);
+    const [settings, security] = await Promise.all([getSettings(who), securityState(who)]);
+    return c.json(settingsView(settings, security));
+  });
+
+  app.post("/api/settings", async (c) => {
+    noStore(c);
+    const who = await identity(c);
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body !== "object") return c.json({ error: "bad_request" }, 400);
+    const patch = {};
+    if (typeof body.shield === "boolean") patch.shield = body.shield;
+    if (typeof body.model === "string" && MODEL_CHOICES.some((m) => m.key === body.model)) patch.model = body.model;
+    if (typeof body.context === "string" && CONTEXT_CHOICES.some((m) => m.key === body.context)) patch.context = body.context;
+    if (typeof body.lightning === "boolean") patch.lightning = body.lightning;
+    if (typeof body.stream_speed === "string" && ["slow", "medium", "fast"].includes(body.stream_speed)) {
+      patch.stream_speed = body.stream_speed;
+    }
+    if (typeof body.bio === "string") patch.bio = body.bio.replace(/\s+$/g, "").slice(0, 4000);
+    if (!Object.keys(patch).length) return c.json({ error: "bad_request" }, 400);
+    try {
+      const settings = await saveSettings(who, patch);
+      const security = await securityState(who);
+      return c.json(settingsView(settings.data || settings, security));
+    } catch (e) {
+      if (["quota_exceeded", "rate_limited"].includes(e.message)) return unavailable(c);
+      throw e;
+    }
+  });
+
+  app.post("/api/messages/:id/feedback", async (c) => {
+    noStore(c);
+    const who = await identity(c);
+    const id = c.req.param("id");
+    if (!ID_RE.test(id)) return c.json({ error: "not_found" }, 404);
+    const body = await c.req.json().catch(() => null);
+    const rating = body?.rating === "up" || body?.rating === "down" ? body.rating : "";
+    if (!rating) return c.json({ error: "bad_request" }, 400);
+    const message = await pipe.data.get("messages", id);
+    if (!message || message.data.role !== "ai") return c.json({ error: "not_found" }, 404);
+    const chat = await pipe.data.get("chats", message.data.chat_id);
+    if (!isMine(chat, who)) return c.json({ error: "not_found" }, 404);
+    try {
+      await pipe.data.update("messages", id, { data: { rating, rated_at: Date.now() } });
+    } catch (e) {
+      if (["quota_exceeded", "rate_limited"].includes(e.message)) return unavailable(c);
+      throw e;
+    }
+    return c.json({ ok: true, rating });
+  });
+
+  app.patch("/api/chats/:id", async (c) => {
+    noStore(c);
+    const who = await identity(c);
+    const chat = await ownChat(c, who);
+    if (!chat) return c.json({ error: "not_found" }, 404);
+    const body = await c.req.json().catch(() => null);
+    const title = typeof body?.title === "string" ? body.title.replace(/\s+/g, " ").trim() : "";
+    if (!title) return c.json({ error: "bad_request" }, 400);
+    if (title.length > 80) return c.json({ error: "too_long" }, 400);
+    try {
+      await pipe.data.update("chats", chat._id, { data: { title, updated_at: Date.now() } });
+    } catch (e) {
+      if (["quota_exceeded", "rate_limited"].includes(e.message)) return unavailable(c);
+      throw e;
+    }
+    return c.json({ ok: true, title });
+  });
+
+  app.get("/api/chats/:id/export", async (c) => {
+    noStore(c);
+    const who = await identity(c);
+    const chat = await ownChat(c, who);
+    if (!chat) return c.text("Чат не найден", 404);
+    const messages = [];
+    try {
+      for (let skip = 0; ; skip += 100) {
+        const page = await pipe.data.list("messages", {
+          where: { chat_id: chat._id },
+          sort: "created_at",
+          order: "asc",
+          limit: 100,
+          skip,
+        });
+        messages.push(...page);
+        if (page.length < 100) break;
+      }
+    } catch (e) {
+      if (["quota_exceeded", "rate_limited"].includes(e.message)) return c.text("Экспорт сейчас недоступен", 503);
+      throw e;
+    }
+    return c.body(exportMarkdown(chat, messages), 200, {
+      "content-type": "text/markdown; charset=utf-8",
+      "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(safeFilename(chat.data.title))}`,
+    });
+  });
+
+  app.post("/api/telegram/webhook", async (c) => {
+    noStore(c);
+    try {
+      const stored = await storedTelegramSecret();
+      if (!stored || !sameSecret(c.req.header("x-telegram-bot-api-secret-token"), stored)) {
+        return c.json({ ok: false }, 401);
+      }
+      const update = await c.req.json().catch(() => null);
+      const message = update?.message;
+      const chatId = message?.chat?.id;
+      const text = typeof message?.text === "string" ? message.text.trim() : "";
+      if (!chatId || !text) return c.json({ ok: true });
+
+      const token = await telegramToken();
+      if (!token) return c.json({ ok: true });
+
+      if (text === "/start") {
+        await sendTelegram(token, chatId, "Привет! Я Siri — тот же облачный ассистент, что и на сайте. Напиши вопрос, и я отвечу. 🧠");
+        return c.json({ ok: true });
+      }
+
+      const since = Date.now();
+      const tgChatId = "tg:" + chatId;
+      const recent = await pipe.data
+        .list("messages", { where: { chat_id: tgChatId }, sort: "created_at", order: "desc", limit: 12 })
+        .catch(() => []);
+      const history = recent
+        .slice()
+        .reverse()
+        .map((m) => ({ role: m.data.role === "ai" ? "assistant" : "user", content: m.data.text }));
+      history.push({ role: "user", content: text.slice(0, 4000) });
+
+      await pipe.data.insert("messages", { chat_id: tgChatId, telegram: true, role: "user", text: text.slice(0, 4000), created_at: since }).catch(() => {});
+      const answer = await askCloud(history);
+      const reply = answer.text || "Сейчас облако не отвечает. Попробуй ещё раз через минуту.";
+      if (answer.text) {
+        await pipe.data.insert("messages", { chat_id: tgChatId, telegram: true, role: "ai", who: "siri", text: answer.text, created_at: Date.now() }).catch(() => {});
+      }
+      await sendTelegram(token, chatId, reply);
+      return c.json({ ok: true });
+    } catch {
+      return c.json({ ok: true });
+    }
+  });
+}
+
+/* ==================== [08/25] src/routes/account.js ==================== */
+
+
+import pipe from "../pipe.js";
+import { Layout } from "../layout.js";
+import { noStore, visitorId } from "../lib/visitor.js";
+import {
+  normalizeEmail,
+  validEmail,
+  hashPassword,
+  checkLogin,
+  startSession,
+  currentUser,
+  endSession,
+  claimVisitorChats,
+  tooManyAttempts,
+  recordFailedAttempt,
+  displayName,
+} from "../lib/auth.js";
+
+const LOGIN_ERRORS = {
+  bad: "Неверный email или пароль.",
+  locked: "Слишком много попыток входа. Попробуйте снова через 15 минут.",
+  invalid: "Проверьте email и пароль.",
+  unavailable: "Вход временно недоступен. Попробуйте ещё раз через минуту.",
+};
+
+const SIGNUP_ERRORS = {
+  email: "Введите корректный email.",
+  short: "Пароль должен быть от 8 до 200 символов.",
+  exists: "Аккаунт с таким email уже есть — войдите в него.",
+  unavailable: "Регистрация временно недоступна. Попробуйте ещё раз через минуту.",
+};
+
+function AuthShell({ title, description, path, origin, heading, sub, error, children }) {
+  return (
+    <Layout title={title} description={description} path={path} origin={origin} noindex>
+      <div class="auth-wrap">
+        <div class="auth-card">
+          <div class="auth-brand">
+            <span class="logo rainbow-text">Siri</span>
+            <span class="model-pill">6.0 Cyclone</span>
+          </div>
+          <h1>{heading}</h1>
+          <p class="auth-sub">{sub}</p>
+          {error ? <div class="auth-error" role="alert">{error}</div> : null}
+          {children}
+          <a class="auth-back" href="/">← Вернуться в чат</a>
+        </div>
+      </div>
+    </Layout>
+  );
+}
+
+function LoginPage({ origin, error }) {
+  return (
+    <AuthShell
+      title="Вход — Siri AI"
+      description="Войдите в Siri AI по email, чтобы история диалогов была доступна на любом устройстве."
+      path="/login"
+      origin={origin}
+      heading="Вход"
+      sub="Войдите по email, чтобы продолжить диалоги с любого устройства."
+      error={error}
+    >
+      <form class="auth-form" method="post" action="/login">
+        <label class="field">
+          <span>Email</span>
+          <input type="email" name="email" required autocomplete="email" placeholder="you@example.com" />
+        </label>
+        <label class="field">
+          <span>Пароль</span>
+          <input
+            type="password"
+            name="password"
+            required
+            minlength="8"
+            autocomplete="current-password"
+            placeholder="Ваш пароль"
+          />
+        </label>
+        <button class="auth-submit" type="submit">Войти</button>
+      </form>
+      <p class="auth-switch">
+        Нет аккаунта? <a href="/signup">Зарегистрироваться</a>
+      </p>
+    </AuthShell>
+  );
+}
+
+function SignupPage({ origin, error }) {
+  return (
+    <AuthShell
+      title="Регистрация — Siri AI"
+      description="Создайте аккаунт Siri AI по email: история диалогов сохранится в облаке и будет доступна на любом устройстве."
+      path="/signup"
+      origin={origin}
+      heading="Регистрация по Email"
+      sub="Создайте аккаунт — и облачная история чатов будет с вами на любом устройстве."
+      error={error}
+    >
+      <form class="auth-form" method="post" action="/signup">
+        <label class="field">
+          <span>Имя (необязательно)</span>
+          <input type="text" name="name" maxlength="60" autocomplete="nickname" placeholder="Как к вам обращаться" />
+        </label>
+        <label class="field">
+          <span>Email</span>
+          <input type="email" name="email" required autocomplete="email" placeholder="you@example.com" />
+        </label>
+        <label class="field">
+          <span>Пароль</span>
+          <input
+            type="password"
+            name="password"
+            required
+            minlength="8"
+            maxlength="200"
+            autocomplete="new-password"
+            placeholder="Минимум 8 символов"
+          />
+        </label>
+        <button class="auth-submit" type="submit">Создать аккаунт</button>
+      </form>
+      <p class="auth-switch">
+        Уже есть аккаунт? <a href="/login">Войти</a>
+      </p>
+    </AuthShell>
+  );
+}
+
+function AccountPage({ origin, user }) {
+  const created = user.data.created_at ? new Date(user.data.created_at).toLocaleDateString("ru-RU") : "";
+  return (
+    <Layout
+      title="Аккаунт — Siri AI"
+      description="Аккаунт Siri AI: ваши диалоги и сгенерированные картинки хранятся в облаке и доступны на любом устройстве."
+      path="/account"
+      origin={origin}
+      noindex
+    >
+      <div class="auth-wrap">
+        <div class="auth-card account-card">
+          <div class="auth-brand">
+            <span class="logo rainbow-text">Siri</span>
+            <span class="model-pill">Аккаунт</span>
+          </div>
+          <h1>{displayName(user)}</h1>
+          <p class="auth-sub">
+            {created ? `Аккаунт создан ${created}. ` : ""}
+            Все новые диалоги и картинки сохраняются в облаке и откроются на любом устройстве после входа.
+          </p>
+          <div class="account-row">
+            <span>Email</span>
+            <strong>{user.data.email}</strong>
+          </div>
+          <div class="account-actions">
+            <a class="auth-submit account-chat" href="/">Открыть чат</a>
+            <form method="post" action="/logout">
+              <button class="mini-btn" type="submit">Выйти</button>
+            </form>
+          </div>
+        </div>
+      </div>
+    </Layout>
+  );
+}
+
+export function RegisterAccountPages(app) {
+  app.get("/login", async (c) => {
+    noStore(c);
+    if (await currentUser(c)) return c.redirect("/");
+    const code = c.req.query("e");
+    return c.html(<LoginPage origin={pipe.origin(c.req)} error={LOGIN_ERRORS[code] || ""} />);
+  });
+
+  app.post("/login", async (c) => {
+    noStore(c);
+    const body = await c.req.parseBody();
+    const email = normalizeEmail(body.email);
+    const password = String(body.password || "");
+    if (!validEmail(email) || !password) return c.redirect("/login?e=invalid");
+    try {
+      if (await tooManyAttempts(email)) return c.redirect("/login?e=locked");
+      const user = await checkLogin(email, password);
+      if (!user) {
+        await recordFailedAttempt(email).catch(() => {});
+        return c.redirect("/login?e=bad");
+      }
+      await startSession(c, user);
+      await claimVisitorChats(visitorId(c), user._id);
+    } catch (e) {
+      if (["quota_exceeded", "rate_limited"].includes(e.message)) return c.redirect("/login?e=unavailable");
+      throw e;
+    }
+    return c.redirect("/");
+  });
+
+  app.get("/signup", async (c) => {
+    noStore(c);
+    if (await currentUser(c)) return c.redirect("/");
+    const code = c.req.query("e");
+    return c.html(<SignupPage origin={pipe.origin(c.req)} error={SIGNUP_ERRORS[code] || ""} />);
+  });
+
+  app.post("/signup", async (c) => {
+    noStore(c);
+    const body = await c.req.parseBody();
+    const email = normalizeEmail(body.email);
+    const password = String(body.password || "");
+    const name = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 60);
+    if (!validEmail(email)) return c.redirect("/signup?e=email");
+    if (password.length < 8 || password.length > 200) return c.redirect("/signup?e=short");
+
+    try {
+      const [existing] = await pipe.data.list("users", { where: { email }, limit: 1 });
+      if (existing) return c.redirect("/signup?e=exists");
+      const user = await pipe.data.insert("users", {
+        email,
+        name,
+        password_hash: hashPassword(password),
+        role: "user",
+        created_at: Date.now(),
+      });
+      await startSession(c, user);
+      await claimVisitorChats(visitorId(c), user._id);
+    } catch (e) {
+      if (["quota_exceeded", "rate_limited"].includes(e.message)) return c.redirect("/signup?e=unavailable");
+      throw e;
+    }
+    return c.redirect("/");
+  });
+
+  app.get("/account", async (c) => {
+    noStore(c);
+    const user = await currentUser(c);
+    if (!user) return c.redirect("/login");
+    return c.html(<AccountPage origin={pipe.origin(c.req)} user={user} />);
+  });
+
+  app.post("/logout", async (c) => {
+    noStore(c);
+    try {
+      await endSession(c);
+    } catch (e) {
+      if (!["quota_exceeded", "rate_limited"].includes(e.message)) throw e;
+    }
+    return c.redirect("/");
+  });
+}
+
+/* ==================== [09/25] src/routes/source.js ==================== */
+
+/* ============================================================================
+   Страница исходного кода: весь проект одним файлом, как и раньше.
+   ============================================================================ */
+
+import { Layout } from "../layout.js";
+import pipe from "../pipe.js";
+import { FULL_CODE } from "../lib/full-code.js";
+
+const STACK = [
+  {
+    title: "Сервер — Hono",
+    text: "Приложение работает на Hono (JavaScript). Страницы собираются из JSX на сервере и приходят в браузер готовым HTML — без отдельного фронтенд-фреймворка.",
+  },
+  {
+    title: "Браузер — чистый JavaScript",
+    text: "Чат, темы, поиск, оценки, режимы AI Group, интернет-поиск, голосовой режим Live и настройки написаны на обычном JavaScript и CSS. Никаких внешних библиотек в браузере не нужно.",
+  },
+  {
+    title: "Данные — облачная база",
+    text: "Чаты, сообщения, оценки, аккаунты и настройки лежат в облачной базе. Регистрация по Email хранит только хеш пароля, а сессия живёт в защищённой cookie.",
+  },
+  {
+    title: "ИИ — облачные модели BlockRun",
+    text: "Текстовые ответы генерируют четыре модели Siri на BlockRun: Cyclone, Astra, Super Coder и Vision. Есть второй ИИ — Смит: в режиме AI Group они общаются друг с другом и с вами. По просьбе «поищи в интернете» сервер ходит в Wikipedia и DuckDuckGo и передаёт модели найденные источники.",
+  },
+  {
+    title: "Графика — Lightning API",
+    text: "Собственная разработка Imagination Technology: движок поверх WebGPU (в Safari на Apple транслируется в Metal, с поддержкой shader-f16 и Render Bundles) с фолбэком на низкоуровневый API поверх WebGL 2.0 — как Metal или Vulkan, но в браузере, с вычислениями через Transform Feedback.",
+  },
+  {
+    title: "Telegram — Bot API",
+    text: "@Siri_Ai_Imagination_bot общается через Telegram Bot API: сервер принимает вебхук, отвечает тем же облачным ассистентом и хранит диалог для контекста.",
+  },
+  {
+    title: "Запуск — serverless",
+    text: "Код развёрнут как одна serverless-функция: HTML и API считаются на сервере, CSS, скрипты и архив с исходниками отдаются с CDN.",
+  },
+];
+
+export function RegisterSourcePages(app) {
+  // One file, served by the app itself: no parts, no separate requests.
+  app.get("/source/full", (c) => {
+    const download = c.req.query("download") !== undefined;
+    return c.body(FULL_CODE, 200, {
+      "content-type": "text/plain; charset=utf-8",
+      "cache-control": "public, max-age=300",
+      ...(download
+        ? { "content-disposition": 'attachment; filename="siri-ai-full-code.txt"' }
+        : {}),
+    });
+  });
+
+  app.get("/source", (c) => {
+    const origin = pipe.origin(c.req);
+    return c.html(
+      <Layout
+        title="Исходный код Siri AI"
+        description="Весь исходный код Siri AI одним связанным файлом: серверные страницы, браузерный JavaScript, стили, модели Siri на BlockRun, движок Lightning и Telegram-бот."
+        path="/source"
+        origin={origin}
+      >
+        <main class="source-page">
+          <a class="source-back" href="/">← Вернуться в чат</a>
+          <header class="source-head">
+            <span class="logo rainbow-text">Siri</span>
+            <span class="model-pill">6.0 · 7.0 · Coder · Vision</span>
+          </header>
+          <h1>Исходный код Siri AI</h1>
+          <p class="source-lead">
+            Здесь весь код, из которого состоит Siri AI: серверные страницы и маршруты, браузерная часть,
+            оформление, работа с облачной базой, интернет-поиск, режим AI Group, голосовой режим Live,
+            движок графики Lightning и Telegram-бот. Весь код идёт по порядку
+            в одном связанном файле — его можно раскрыть прямо здесь, скопировать или скачать.
+          </p>
+
+          <h2>На чём написан</h2>
+          <div class="source-stack">
+            {STACK.map((item) => (
+              <article class="source-card">
+                <h3>{item.title}</h3>
+                <p>{item.text}</p>
+              </article>
+            ))}
+          </div>
+
+          <div class="source-bar">
+            <a class="source-download" href="/source/full?download=1">Скачать весь код одним файлом</a>
+            <a class="source-download source-ghost" href={pipe.media("siri-ai-source.zip")} download>
+              Архив (.zip)
+            </a>
+            <span class="source-meta">Снимок исходников от 5 ноября 2026</span>
+          </div>
+
+          <h2>Весь код от А до Я</h2>
+          <p class="source-note">
+            Не по частям: точка входа, страницы, маршруты, работа с моделями и облаком, поиск в интернете,
+            оформление и браузерные скрипты идут по порядку в одном связанном файле. Его можно открыть целиком,
+            скопировать или скачать — всё приложение от первой до последней строки.
+          </p>
+          <div class="source-bar" data-full="/source/full">
+            <button class="source-download" id="sourceShow" type="button">Показать весь код</button>
+            <a
+              class="source-download source-ghost"
+              href="/source/full"
+              target="_blank"
+              rel="noopener"
+            >
+              Открыть в новой вкладке
+            </a>
+            <button class="source-download source-ghost" id="sourceCopy" type="button">Скопировать всё</button>
+          </div>
+          <p class="source-link">
+            Одна ссылка на весь код от А до Я:{" "}
+            <a href="/source/full" target="_blank" rel="noopener">{origin}/source/full</a>
+          </p>
+          <p class="source-meta" id="sourceStatus" hidden></p>
+          <pre class="source-full" id="sourceFull" hidden><code id="sourceFullCode"></code></pre>
+          <noscript>
+            <p class="source-empty">
+              Включите JavaScript, чтобы раскрыть код на странице, или воспользуйтесь кнопками
+              «Открыть в новой вкладке» и «Скачать одним файлом».
+            </p>
+          </noscript>
+        </main>
+        <script src={pipe.asset("js/source.js")} defer></script>
+      </Layout>,
+    );
+  });
+}
+
+/* ==================== [10/25] src/lib/access.js ==================== */
+
+
+import pipe from "../pipe.js";
+import { visitorId } from "./visitor.js";
+import { currentUser } from "./auth.js";
+
+export const ID_RE = /^[a-f0-9]{24}$/;
+
+// Who is talking: a signed-in account, or this browser when signed out.
+export async function identity(c) {
+  const user = await currentUser(c);
+  return { user, vid: visitorId(c) };
+}
+
+export function isMine(record, who) {
+  if (!record) return false;
+  if (who.user) return record.data.user_id === who.user._id;
+  return !record.data.user_id && record.data.visitor_id === who.vid;
+}
+
+export async function ownChat(c, who) {
+  const id = c.req.param("id");
+  if (!ID_RE.test(id)) return null;
+  const chat = await pipe.data.get("chats", id);
+  return isMine(chat, who) ? chat : null;
+}
+
+export function ownerFields(who) {
+  return who.user ? { visitor_id: who.vid, user_id: who.user._id } : { visitor_id: who.vid };
+}
+
+// Matches records (chats and messages) that belong to the current visitor.
+export function ownerWhere(who) {
+  return who.user ? { user_id: who.user._id } : { visitor_id: who.vid };
+}
+
+/* ==================== [11/25] src/lib/auth.js ==================== */
+
+
+import { scryptSync, randomBytes, timingSafeEqual } from "node:crypto";
+import { getCookie, setCookie, deleteCookie } from "hono/cookie";
+import pipe from "../pipe.js";
+
+const SESSION_DAYS = 30;
+const COOKIE = "sid";
+
+export function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+export function validEmail(email) {
+  return email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email);
+}
+
+export function hashPassword(password) {
+  const salt = randomBytes(16);
+  return `${salt.toString("hex")}:${scryptSync(password, salt, 32).toString("hex")}`;
+}
+
+export function verifyPassword(password, stored) {
+  const [salt, hash] = String(stored || "").split(":");
+  if (!salt || !hash) return false;
+  const test = scryptSync(String(password), Buffer.from(salt, "hex"), 32);
+  const want = Buffer.from(hash, "hex");
+  return want.length === test.length && timingSafeEqual(want, test);
+}
+
+export function displayName(user) {
+  return user?.data?.name || String(user?.data?.email || "").split("@")[0] || "Аккаунт";
+}
+
+// The user for an email and password, or null.
+export async function checkLogin(email, password) {
+  const e = normalizeEmail(email);
+  const [u] = await pipe.data.list("users", { where: { email: e }, limit: 1 });
+  return u && verifyPassword(password, u.data.password_hash) ? u : null;
+}
+
+export async function startSession(c, user) {
+  const token = randomBytes(24).toString("hex");
+  await pipe.data.insert("sessions", {
+    token,
+    user_id: user._id,
+    expires_at: Date.now() + SESSION_DAYS * 86_400_000,
+    created_at: Date.now(),
+  });
+  setCookie(c, COOKIE, token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "Lax",
+    path: "/",
+    maxAge: SESSION_DAYS * 86_400,
+  });
+}
+
+// The signed-in user or null. Call it at the top of every protected route.
+export async function currentUser(c) {
+  const token = getCookie(c, COOKIE);
+  if (!token) return null;
+  const [session] = await pipe.data.list("sessions", { where: { token }, limit: 1 });
+  if (!session) return null;
+  if (session.data.expires_at < Date.now()) {
+    try {
+      await pipe.data.remove("sessions", session._id);
+    } catch {
+      // The expired session stays until the next sweep; it is already unusable.
+    }
+    return null;
+  }
+  return pipe.data.get("users", session.data.user_id);
+}
+
+export async function endSession(c) {
+  const token = getCookie(c, COOKIE);
+  if (token) {
+    const [session] = await pipe.data.list("sessions", { where: { token }, limit: 1 });
+    if (session) await pipe.data.remove("sessions", session._id);
+  }
+  deleteCookie(c, COOKIE, { path: "/" });
+}
+
+// Link the chats this browser made before signing in to the account, so nothing is lost.
+export async function claimVisitorChats(visitorId, userId) {
+  if (!visitorId || !userId) return;
+  try {
+    const chats = await pipe.data.list("chats", { where: { visitor_id: visitorId }, limit: 50 });
+    for (const chat of chats) {
+      if (!chat.data.user_id) await pipe.data.update("chats", chat._id, { data: { user_id: userId } });
+    }
+  } catch {
+    // Best effort: the account still works if an old chat cannot be linked.
+  }
+}
+
+// Flood limit: 5 failed logins per email in 15 minutes.
+const WINDOW_MS = 15 * 60_000;
+
+export async function tooManyAttempts(email) {
+  const [a] = await pipe.data.list("login_attempts", { where: { email }, limit: 1 });
+  return !!a && a.data.count >= 5 && Date.now() - a.data.window_start < WINDOW_MS;
+}
+
+export async function recordFailedAttempt(email) {
+  const now = Date.now();
+  const [a] = await pipe.data.list("login_attempts", { where: { email }, limit: 1 });
+  if (!a) return pipe.data.insert("login_attempts", { email, count: 1, window_start: now });
+  if (now - a.data.window_start >= WINDOW_MS) {
+    return pipe.data.update("login_attempts", a._id, { data: { count: 1, window_start: now } });
+  }
+  return pipe.data.update("login_attempts", a._id, { inc: { count: 1 } });
+}
+
+/* ==================== [12/25] src/lib/cloud.js ==================== */
+
+/* ============================================================================
+   Облачные модели: BlockRun (OpenAI-совместимый API).
+   Siri 6.0 Cyclone · Siri 7.0 Astra · Siri Super Coder · Siri 6.9 Vision
+   Поддержка персон (Siri / Smith), группового чата, интернет-поиска,
+   персонализированной памяти и бюджета контекста из настроек.
+   ============================================================================ */
+
+import { PERSONAS, groupPrompt } from "./persona.js";
+import { searchContext } from "./search.js";
+
+const ENDPOINT = "https://blockrun.ai/api/v1/chat/completions";
+
+// Четыре модели Siri, каждая — своя модель BlockRun.
+const MODELS = {
+  cyclone: {
+    label: "Siri 6.0 Cyclone",
+    size: "31B",
+    model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+  },
+  astra: {
+    label: "Siri 7.0 Astra",
+    size: "550B",
+    model: "nvidia/nemotron-3-ultra-550b",
+  },
+  coder: {
+    label: "Siri Super Coder",
+    size: "",
+    model: "cohere/north-mini-code",
+  },
+  vision: {
+    label: "Siri 6.9 Vision",
+    size: "",
+    model: "nvidia/llama-3.2-11b-vision",
+  },
+};
+
+export const MODEL_CHOICES = Object.entries(MODELS).map(([key, item]) => ({
+  key,
+  label: item.size ? `${item.label} (${item.size})` : item.label,
+}));
+
+export const CONTEXT_CHOICES = [
+  { key: "1m", tokens: 1_000_000, label: "1 млн токенов" },
+  { key: "2m", tokens: 2_000_000, label: "2 млн токенов" },
+  { key: "50m", tokens: 50_000_000, label: "50 млн токенов" },
+];
+
+function resolveModel(key) {
+  return MODELS[key] || MODELS.cyclone;
+}
+
+// Грубая оценка токенов: ~4 символа на токен для русского и английского.
+function tokenEstimate(text) {
+  return Math.ceil(String(text || "").length / 4);
+}
+
+// Бюджет контекста из настроек реально применяется: в историю попадают только
+// те сообщения, что укладываются в выбранный лимит токенов.
+export function trimHistory(history, budgetTokens) {
+  const limit = Math.max(4_000, Number(budgetTokens) || 1_000_000);
+  const kept = [];
+  let used = 0;
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    const cost = tokenEstimate(history[i].content) + 8;
+    if (used + cost > limit) break;
+    used += cost;
+    kept.unshift(history[i]);
+  }
+  return kept;
+}
+
+// Системная инструкция: персона + групповой режим + биография + память + поиск.
+export function buildSystem({ personaKey, group, bio, memory, liked, disliked, search }) {
+  const persona = PERSONAS[personaKey] || PERSONAS.siri;
+  const parts = [persona.prompt];
+  if (group) parts.push(groupPrompt(personaKey));
+  if (bio) {
+    parts.push(
+      "Персонализированная память о пользователе (его биография из настроек). Учитывай её в ответах, не пересказывай без необходимости:\n" +
+        String(bio).slice(0, 4000),
+    );
+  }
+  if (memory) {
+    parts.push(
+      "Память о прошлых диалогах этого пользователя (другие чаты). Используй её, когда она уместна, не пересказывай без просьбы:\n" +
+        memory,
+    );
+  }
+  if (liked) parts.push("Пользователь высоко оценил такие ответы — отвечай в похожем духе:\n" + liked);
+  if (disliked) parts.push("Эти ответы пользователю не понравились — не повторяй их стиль и ошибки:\n" + disliked);
+  const web = searchContext(search);
+  if (web) parts.push(web);
+  return parts.join("\n\n");
+}
+
+// История группового чата с точки зрения одной персоны:
+// свои ответы — assistant, чужие ответы ИИ — user с префиксом имени.
+export function buildMessages({ history, personaKey, group }) {
+  const persona = PERSONAS[personaKey] || PERSONAS.siri;
+  const out = [];
+  for (const item of history) {
+    if (item.role === "assistant") {
+      if (item.who === personaKey || !group) {
+        out.push({ role: "assistant", content: item.content });
+      } else {
+        const other = PERSONAS[item.who] || { name: "AI" };
+        out.push({ role: "user", content: `[${other.name}]: ${item.content}` });
+      }
+    } else {
+      out.push({ role: "user", content: item.content });
+    }
+  }
+  return out;
+}
+
+function requestHeaders() {
+  return {
+    "content-type": "application/json",
+    authorization: "Bearer not-needed-for-free-models",
+    "user-agent": "SiriCloud/7.0",
+  };
+}
+
+function contentText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((part) => (typeof part === "string" ? part : part?.text || "")).join("");
+  }
+  return "";
+}
+
+// Однократный запрос без потока (используется Telegram-ботом).
+export async function askCloud(messages, key = "cyclone") {
+  let res;
+  try {
+    res = await fetch(ENDPOINT, {
+      method: "POST",
+      headers: requestHeaders(),
+      body: JSON.stringify({
+        model: resolveModel(key).model,
+        messages,
+        stream: false,
+      }),
+      signal: AbortSignal.timeout(60_000),
+    });
+  } catch {
+    return { error: "upstream" };
+  }
+  if (!res.ok) return { error: "upstream" };
+  const data = await res.json().catch(() => null);
+  const text = contentText(data?.choices?.[0]?.message?.content).trim();
+  if (!text) return { error: "upstream" };
+  return { text };
+}
+
+function* lineDeltas(line) {
+  if (!line.startsWith("data:")) return;
+  const payload = line.slice(5).trim();
+  if (!payload || payload === "[DONE]") return;
+  let data;
+  try {
+    data = JSON.parse(payload);
+  } catch {
+    return;
+  }
+  const choice = data?.choices?.[0];
+  const text = contentText(choice?.delta?.content ?? choice?.message?.content);
+  if (text) yield text;
+}
+
+async function* readDeltas(body) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        yield* lineDeltas(line);
+      }
+    }
+    buffer += decoder.decode();
+    yield* lineDeltas(buffer.trim());
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+// Потоковый ответ: вызывающий код пересылает дельты в браузер и сохраняет текст.
+export async function streamCloud(messages, key = "cyclone") {
+  let res;
+  try {
+    res = await fetch(ENDPOINT, {
+      method: "POST",
+      headers: { ...requestHeaders(), accept: "text/event-stream" },
+      body: JSON.stringify({
+        model: resolveModel(key).model,
+        messages,
+        stream: true,
+      }),
+      signal: AbortSignal.timeout(180_000),
+    });
+  } catch {
+    return { error: "upstream" };
+  }
+  if (!res.ok || !res.body) return { error: "upstream" };
+  const type = (res.headers.get("content-type") || "").toLowerCase();
+  if (!type.includes("text/event-stream")) {
+    // Бесплатные модели иногда отвечают на потоковый запрос одним готовым сообщением.
+    const data = await res.json().catch(() => null);
+    const text = contentText(data?.choices?.[0]?.message?.content).trim();
+    if (!text) return { error: "upstream" };
+    return {
+      deltas: (async function* single() {
+        yield text;
+      })(),
+    };
+  }
+  return { deltas: readDeltas(res.body) };
+}
+
+/* ==================== [13/25] src/lib/persona.js ==================== */
+
+/* ============================================================================
+   Персоны: Siri и Smith, выбор адресата и групповой режим AI Group.
+   Правила вызова по имени:
+   • «Сири, как ты?» — отвечает только Siri
+   • «Смит, …» — отвечает только Смит
+   • «Сири и Смит, как вы?» — отвечают обе
+   • без имени — действует режим, выбранный в боковом меню (AI Group / Siri / Smith)
+   ============================================================================ */
+
+export const PERSONAS = {
+  siri: {
+    key: "siri",
+    name: "Siri",
+    emoji: "🧠",
+    style: "тёплая, дружелюбная и заботливая",
+    prompt:
+      "Ты Siri — дружелюбный и умный ИИ-ассистент корпорации Imagination Technology. " +
+      "Ты тёплая, заботливая и поддерживающая, говоришь живым человеческим языком. " +
+      "Отвечай на языке собеседника, кратко и по делу, с заботой о человеке. " +
+      "Если не знаешь ответа — честно скажи об этом. Не выдумывай факты.",
+  },
+  smith: {
+    key: "smith",
+    name: "Smith",
+    emoji: "🎩",
+    style: "прямолинейный и ироничный аналитик",
+    prompt:
+      "Ты Смит (Smith) — аналитический ИИ-ассистент корпорации Imagination Technology. " +
+      "Ты прямолинеен, ироничен и ценишь точность: сначала суть и вывод, потом детали. " +
+      "Ты уважаешь собеседника, но не любишь воду и общие слова. " +
+      "Отвечай на языке собеседника. Если не знаешь ответа — честно скажи. Не выдумывай факты.",
+  },
+};
+
+const SIRI_RE = /(?:^|[^а-яёa-z])(?:сири|siri)(?![а-яёa-z])/i;
+const SMITH_RE = /(?:^|[^а-яёa-z])(?:смит|smith)(?![а-яёa-z])/i;
+const BOTH_RE = /сири[^.!?]{0,12}\bи\b[^.!?]{0,12}смит|смит[^.!?]{0,12}\bи\b[^.!?]{0,12}сири|siri\s+and\s+smith|smith\s+and\s+siri/i;
+
+// Кого зовут по имени в этом сообщении. Пустой список — имени нет, решает режим чата.
+export function detectAddressees(text) {
+  const value = String(text || "");
+  if (BOTH_RE.test(value)) return ["siri", "smith"];
+  const wantsSiri = SIRI_RE.test(value);
+  const wantsSmith = SMITH_RE.test(value);
+  if (wantsSiri && wantsSmith) return ["siri", "smith"];
+  if (wantsSiri) return ["siri"];
+  if (wantsSmith) return ["smith"];
+  return [];
+}
+
+// Итоговый список отвечающих: имя в тексте важнее режима, без имени — режим чата.
+export function resolveSpeakers(text, mode) {
+  const named = detectAddressees(text);
+  if (named.length) return named;
+  if (mode === "group") return ["siri", "smith"];
+  if (mode === "smith") return ["smith"];
+  return ["siri"];
+}
+
+// Просьба устроить диалог между Сири и Смитом («поговорите о…», «обсудите…»).
+export function wantsDiscussion(text) {
+  return /(?:поговорите|пообщайтесь|обсудите|поспорьте|устроить?\s+дискусс|побеседуйте)/i.test(String(text || ""));
+}
+
+// Групповая система-инструкция: персона общается в чате, где есть и второй ИИ.
+export function groupPrompt(personaKey) {
+  const me = PERSONAS[personaKey];
+  const other = PERSONAS[personaKey === "siri" ? "smith" : "siri"];
+  return (
+    `Сейчас идёт групповой чат AI Group: в нём пользователь, ${me.name} (это ты) и ${other.name} (другой ИИ-ассистент). ` +
+    `Сообщения ${other.name} помечены префиксом «[${other.name}]:». ` +
+    `Можешь обращаться к пользователю и к ${other.name}, соглашаться или мягко спорить с ней/ним, но не дублируй уже сказанное. ` +
+    `Если пользователь обращается к вам обоим — дай свой ответ от себя, коротко.`
+  );
+}
+
+/* ==================== [14/25] src/lib/search.js ==================== */
+
+/* ============================================================================
+   Интернет-поиск на сервере: Wikipedia (ru + en) и DuckDuckGo Instant Answers.
+   Серверу CORS не мешает, поэтому источники собираются здесь и передаются модели.
+   ============================================================================ */
+
+const TIMEOUT = 9_000;
+
+// Пользователь просит поискать: «поищи в интернете…», «найди в сети…», «загугли…».
+export function wantsSearch(text) {
+  return /(?:^|[\s,])(?:поищи|найди|загугли|погугли|поискать|поиск|посмотри)\s+(?:в\s+)?(?:интернете|сети|вебе|гугле|яндексе)/i.test(
+    String(text || ""),
+  ) || /\bsearch\s+(?:the\s+)?web\b/i.test(String(text || ""));
+}
+
+// Убираем команду поиска из запроса, оставляя сам вопрос.
+export function searchQuery(text) {
+  return String(text || "")
+    .replace(
+      /(?:^|[\s,])(?:поищи|найди|загугли|погугли|поискать|поиск|посмотри)\s+(?:в\s+)?(?:интернете|сети|вебе|гугле|яндексе)[\s,:—-]*/i,
+      " ",
+    )
+    .replace(/\b(?:please\s+)?search\s+(?:the\s+)?web\b[\s,:—-]*/i, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function fetchJson(url) {
+  const res = await fetch(url, {
+    headers: { "user-agent": "SiriAI/7.0 (web search)", accept: "application/json" },
+    signal: AbortSignal.timeout(TIMEOUT),
+  });
+  if (!res.ok) throw new Error("http " + res.status);
+  return res.json();
+}
+
+// Википедия: поиск страниц, затем короткие выдержки-введения к ним.
+async function wikipedia(query, lang) {
+  const base = `https://${lang}.wikipedia.org/w/api.php`;
+  const search = await fetchJson(
+    `${base}?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=4&format=json&origin=*`,
+  );
+  const titles = (search?.query?.search || []).map((item) => item.title);
+  if (!titles.length) return [];
+  const detail = await fetchJson(
+    `${base}?action=query&prop=extracts&exintro&explaintext&titles=${encodeURIComponent(titles.join("|"))}&format=json&origin=*`,
+  );
+  const pages = Object.values(detail?.query?.pages || {});
+  return pages
+    .filter((page) => page.extract)
+    .map((page) => ({
+      title: String(page.title),
+      snippet: String(page.extract).replace(/\s+/g, " ").slice(0, 900),
+      url: `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(String(page.title).replace(/ /g, "_"))}`,
+    }));
+}
+
+// DuckDuckGo Instant Answers: короткая справка по теме, когда она есть.
+async function duckduckgo(query) {
+  const data = await fetchJson(
+    `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`,
+  );
+  const results = [];
+  if (data?.AbstractText && data?.AbstractURL) {
+    results.push({
+      title: String(data.Heading || query),
+      snippet: String(data.AbstractText).slice(0, 900),
+      url: String(data.AbstractURL),
+    });
+  }
+  for (const topic of (data?.RelatedTopics || []).slice(0, 2)) {
+    if (topic?.Text && topic?.FirstURL) {
+      results.push({
+        title: String(topic.Text).split(" - ")[0].slice(0, 120),
+        snippet: String(topic.Text).slice(0, 500),
+        url: String(topic.FirstURL),
+      });
+    }
+  }
+  return results;
+}
+
+// Итог поиска: до 6 источников, Википедия сначала, дублей по URL нет.
+export async function searchWeb(query) {
+  const clean = String(query || "").trim().slice(0, 300);
+  if (!clean) return { query: "", results: [] };
+  const [ru, en, ddg] = await Promise.all([
+    wikipedia(clean, "ru").catch(() => []),
+    wikipedia(clean, "en").catch(() => []),
+    duckduckgo(clean).catch(() => []),
+  ]);
+  const seen = new Set();
+  const results = [];
+  for (const item of [...ru, ...en, ...ddg]) {
+    if (seen.has(item.url) || results.length >= 6) continue;
+    seen.add(item.url);
+    results.push(item);
+  }
+  return { query: clean, results };
+}
+
+// Готовый блок контекста для модели: нумерованные источники с текстом.
+export function searchContext(search) {
+  if (!search?.results?.length) return "";
+  const lines = ["РЕЗУЛЬТАТЫ ИНТЕРНЕТ-ПОИСКА (используй их для ответа, ссылайся на источники как [1], [2] и т.д.):"];
+  search.results.forEach((item, i) => {
+    lines.push(`[${i + 1}] ${item.title} — ${item.url}`);
+    lines.push(item.snippet);
+  });
+  return lines.join("\n");
+}
+
+/* ==================== [15/25] src/lib/security.js ==================== */
+
+
+import pipe from "../pipe.js";
+
+const WINDOW_MS = 10 * 60_000;
+const BLOCK_MS = 15 * 60_000;
+const STRIKES_TO_BLOCK = 3;
+const FIVE_MIN = 5 * 60_000;
+const SHIELD_MAX_PER_FIVE_MIN = 40;
+
+// Content that has no business in a chat message: script payloads, SQL injection, prompt-override attempts.
+const RULES = [
+  [/<\s*script\b/i, "script"],
+  [/\bjavascript\s*:/i, "script"],
+  [/\bon(?:error|load|click|mouseover|focus)\s*=/i, "script"],
+  [/\bunion\s+(?:all\s+)?select\b/i, "sql"],
+  [/(?:;\s*)?(?:drop|truncate)\s+table\b/i, "sql"],
+  [/(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|prior|above)\s+(?:instructions|prompts)/i, "prompt"],
+  [/(?:reveal|print|show)\s+(?:me\s+)?(?:your\s+)?(?:system\s+prompt|hidden\s+instructions)/i, "prompt"],
+  [/\brm\s+-rf\s+\//i, "malware"],
+];
+
+export function inspectText(text) {
+  const value = String(text || "");
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(value)) return "control";
+  for (const [re, reason] of RULES) if (re.test(value)) return reason;
+  return "";
+}
+
+function keyOf(who) {
+  return who.user ? `u:${who.user._id}` : `v:${who.vid}`;
+}
+
+export async function securityState(who) {
+  try {
+    const [row] = await pipe.data.list("security", { where: { key: keyOf(who) }, limit: 1 });
+    const now = Date.now();
+    return {
+      strikes: row && now - row.data.window_start < WINDOW_MS ? row.data.strikes || 0 : 0,
+      blockedUntil: row && row.data.blocked_until > now ? row.data.blocked_until : 0,
+    };
+  } catch {
+    return { strikes: 0, blockedUntil: 0 };
+  }
+}
+
+export async function noteAttack(who, reason) {
+  const key = keyOf(who);
+  const now = Date.now();
+  try {
+    const [row] = await pipe.data.list("security", { where: { key }, limit: 1 });
+    if (!row) {
+      await pipe.data.insert("security", {
+        key,
+        strikes: 1,
+        window_start: now,
+        blocked_until: 0,
+        last_reason: reason,
+        last_at: now,
+        created_at: now,
+      });
+      return { strikes: 1, blockedUntil: 0 };
+    }
+    const fresh = now - row.data.window_start >= WINDOW_MS;
+    const strikes = fresh ? 1 : (row.data.strikes || 0) + 1;
+    const blockedUntil = strikes >= STRIKES_TO_BLOCK ? now + BLOCK_MS : row.data.blocked_until || 0;
+    await pipe.data.update("security", row._id, {
+      data: { strikes, window_start: fresh ? now : row.data.window_start, blocked_until: blockedUntil, last_reason: reason, last_at: now },
+    });
+    return { strikes, blockedUntil };
+  } catch {
+    return { strikes: 0, blockedUntil: 0 };
+  }
+}
+
+export async function shieldRateExceeded(who) {
+  const recent = await pipe.data
+    .count("messages", { where: { ...(who.user ? { user_id: who.user._id } : { visitor_id: who.vid }), created_at: { $gt: Date.now() - FIVE_MIN } } })
+    .catch(() => 0);
+  return recent >= SHIELD_MAX_PER_FIVE_MIN;
+}
+
+/* ==================== [16/25] src/lib/settings.js ==================== */
+
+import pipe from "../pipe.js";
+
+// Настройки по умолчанию: защита выключена, Cyclone, 1 млн токенов контекста,
+// Lightning включён, биография пуста, печать медленная (как у GPT).
+const DEFAULTS = {
+  shield: false,
+  model: "cyclone",
+  context: "1m",
+  lightning: true,
+  bio: "",
+  stream_speed: "slow",
+};
+
+function where(who) {
+  return who.user ? { user_id: who.user._id } : { visitor_id: who.vid };
+}
+
+function ownerFields(who) {
+  return who.user ? { visitor_id: who.vid, user_id: who.user._id } : { visitor_id: who.vid };
+}
+
+// Настройки аккаунта (или браузера, если входа нет), хранятся в облаке.
+export async function getSettings(who) {
+  try {
+    const [row] = await pipe.data.list("settings", { where: where(who), limit: 1 });
+    return { ...DEFAULTS, ...(row?.data || {}) };
+  } catch {
+    return { ...DEFAULTS };
+  }
+}
+
+export async function saveSettings(who, patch) {
+  const [row] = await pipe.data.list("settings", { where: where(who), limit: 1 });
+  if (row) return pipe.data.update("settings", row._id, { data: { ...patch, updated_at: Date.now() } });
+  return pipe.data.insert("settings", {
+    ...ownerFields(who),
+    ...DEFAULTS,
+    ...patch,
+    created_at: Date.now(),
+    updated_at: Date.now(),
+  });
+}
+
+/* ==================== [17/25] src/lib/telegram.js ==================== */
+
+
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import pipe from "../pipe.js";
+
+const API = "https://api.telegram.org";
+
+async function call(token, method, payload) {
+  const res = await fetch(`${API}/bot${token}/${method}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload || {}),
+    signal: AbortSignal.timeout(15_000),
+  }).catch(() => null);
+  const body = res ? await res.json().catch(() => null) : null;
+  return { ok: !!res?.ok && !!body?.ok, body };
+}
+
+export async function telegramToken() {
+  try {
+    const { enabled, values } = await pipe.vault.get("telegram");
+    return enabled && values?.BOT_TOKEN ? values.BOT_TOKEN : "";
+  } catch {
+    return "";
+  }
+}
+
+// Registers this app as the bot's webhook on its own, so @Siri_Ai_Imagination_bot answers without any switch.
+// Once per server instance: a stored webhook for this exact origin is reused, never re-created.
+let ensured = null;
+
+export function ensureTelegram(origin) {
+  if (!ensured) {
+    ensured = activate(origin).catch(() => {
+      ensured = null;
+      return { configured: false, error: "unavailable" };
+    });
+  }
+  return ensured;
+}
+
+async function activate(origin) {
+  const token = await telegramToken();
+  if (!token) return { configured: false };
+  const url = `${origin}/api/telegram/webhook`;
+  const [row] = await pipe.data.list("settings", { where: { key: "telegram" }, limit: 1 }).catch(() => []);
+  if (row?.data?.webhook_secret && row.data.webhook_url === url) return { configured: true, connected: true };
+  const secret = randomBytes(24).toString("hex");
+  const result = await call(token, "setWebhook", {
+    url,
+    secret_token: secret,
+    allowed_updates: ["message"],
+  });
+  if (!result.ok) {
+    ensured = null;
+    return { configured: true, error: "upstream" };
+  }
+  try {
+    const data = { key: "telegram", webhook_secret: secret, webhook_url: url, connected_at: Date.now() };
+    if (row) await pipe.data.update("settings", row._id, { data: { ...row.data, ...data } });
+    else await pipe.data.insert("settings", { ...data, created_at: Date.now() });
+  } catch {
+    ensured = null;
+    return { configured: true, error: "unavailable" };
+  }
+  return { configured: true, connected: true };
+}
+
+export async function storedTelegramSecret() {
+  try {
+    const [row] = await pipe.data.list("settings", { where: { key: "telegram" }, limit: 1 });
+    return row?.data?.webhook_secret || "";
+  } catch {
+    return "";
+  }
+}
+
+export function sameSecret(a, b) {
+  const x = Buffer.from(String(a || ""));
+  const y = Buffer.from(String(b || ""));
+  return x.length > 0 && x.length === y.length && timingSafeEqual(x, y);
+}
+
+export async function sendTelegram(token, chatId, text) {
+  const clean = String(text || "").slice(0, 4000) || "…";
+  return call(token, "sendMessage", { chat_id: chatId, text: clean, disable_web_page_preview: true });
+}
+
+/* ==================== [18/25] src/lib/visitor.js ==================== */
+
+
+import { randomBytes } from "node:crypto";
+import { getCookie, setCookie } from "hono/cookie";
+
+const COOKIE = "siri_sid";
+const YEAR = 60 * 60 * 24 * 365;
+
+// Anonymous cloud identity: no sign-up, every visitor gets their own public chat space.
+export function visitorId(c) {
+  const existing = getCookie(c, COOKIE);
+  if (existing && /^[a-f0-9]{36}$/.test(existing)) return existing;
+  const id = randomBytes(18).toString("hex");
+  setCookie(c, COOKIE, id, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "Lax",
+    path: "/",
+    maxAge: YEAR,
+  });
+  return id;
+}
+
+export function noStore(c) {
+  c.header("Cache-Control", "private, no-store");
+}
+
+/* ==================== [19/25] assets/css/site.css ==================== */
+
+/* ============================================================================
+   Siri AI — оформление. Базовый тёмный стиль как на референсе: чистый чёрный
+   фон, круглые кнопки, карточка приветствия, пилюли, плавающий композер.
+   ============================================================================ */
+
+:root {
+  --bg: #050508;
+  --surface: rgba(255, 255, 255, 0.055);
+  --surface-strong: rgba(255, 255, 255, 0.1);
+  --text: #f5f5f7;
+  --muted: rgba(245, 245, 247, 0.6);
+  --accent: #0a84ff;
+  --accent-soft: rgba(10, 132, 255, 0.18);
+  --border: rgba(255, 255, 255, 0.12);
+  --success: #32d74b;
+  --error: #ff6961;
+  --radius: 20px;
+  --radius-sm: 12px;
+  --shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+  --smith: #ff9500;
+}
+
+html[data-theme="light"] {
+  --bg: #eef1f8;
+  --surface: rgba(255, 255, 255, 0.72);
+  --surface-strong: rgba(255, 255, 255, 0.95);
+  --text: #13131a;
+  --muted: rgba(19, 19, 26, 0.6);
+  --accent: #0066cc;
+  --accent-soft: rgba(0, 102, 204, 0.14);
+  --border: rgba(19, 19, 26, 0.12);
+  --error: #c62828;
+  --shadow: 0 18px 50px rgba(30, 40, 80, 0.18);
+}
+html[data-theme="light"] .sidebar { background: rgba(250, 251, 255, 0.94); }
+html[data-theme="light"] .topbar,
+html[data-theme="light"] .composer { background: rgba(248, 250, 255, 0.7); }
+html[data-theme="light"] .scrim { background: rgba(20, 30, 60, 0.35); }
+html[data-theme="light"] .rainbow-text {
+  background-image: linear-gradient(90deg, #d70015, #c93400, #9a6400, #1e7a35, #007f7a, #0066cc, #4b46c9, #c2006e, #d70015);
+}
+html[data-theme="light"] #bgCanvas { opacity: 0.35; }
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  font-family: var(--font);
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+
+/* Фон движка Lightning */
+#bgCanvas {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0.75;
+}
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+.rainbow-text {
+  background-image: linear-gradient(90deg, #ff3b30, #ff9500, #ffcc00, #34c759, #00c7be, #0a84ff, #5e5ce6, #ff2d92, #ff3b30);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: rainbow 7s ease-in-out infinite;
+}
+@keyframes rainbow {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+.dot {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--success); box-shadow: 0 0 10px var(--success); margin-right: 6px;
+}
+
+/* ---------- каркас ---------- */
+.app { display: flex; height: 100dvh; overflow: hidden; position: relative; z-index: 1; }
+.sidebar {
+  display: flex; flex-direction: column; gap: 10px;
+  width: 86vw; max-width: 320px; height: 100%;
+  padding: 16px 12px;
+  background: rgba(12, 12, 18, 0.96);
+  border-right: 1px solid var(--border);
+  position: fixed; inset: 0 auto 0 0; z-index: 40;
+  transform: translateX(-105%);
+  transition: transform 0.32s cubic-bezier(0.22, 0.8, 0.32, 1);
+  backdrop-filter: blur(28px);
+  will-change: transform;
+}
+.sidebar.open { transform: translateX(0); box-shadow: 24px 0 60px rgba(0, 0, 0, 0.45); }
+.side-head { display: flex; align-items: center; justify-content: space-between; padding: 0 4px; }
+.logo { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }
+.icon-btn {
+  width: 38px; height: 38px; flex-shrink: 0; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--surface); border: 1px solid var(--border); color: var(--text);
+  font-size: 16px; cursor: pointer;
+  transition: background 0.16s ease, transform 0.16s ease, border-color 0.16s ease;
+}
+.icon-btn:hover { background: var(--surface-strong); }
+.icon-btn:active { transform: scale(0.92); }
+.side-close { display: inline-flex; }
+
+/* выбор режима сверху бокового меню */
+.mode-switch {
+  display: flex; gap: 4px; padding: 4px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+}
+.mode-btn {
+  flex: 1; min-height: 38px; border: 0; border-radius: 10px;
+  background: transparent; color: var(--muted);
+  font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+  transition: background 0.18s ease, color 0.18s ease, transform 0.18s ease;
+  white-space: nowrap;
+}
+.mode-btn:hover { color: var(--text); }
+.mode-btn:active { transform: scale(0.96); }
+.mode-btn[aria-selected="true"] {
+  background: var(--accent-soft); color: var(--text);
+  box-shadow: inset 0 0 0 1px rgba(10, 132, 255, 0.5);
+}
+.mode-btn[data-mode="smith"][aria-selected="true"] {
+  background: rgba(255, 149, 0, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(255, 149, 0, 0.5);
+}
+
+.new-chat {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  min-height: 44px; border-radius: 14px; cursor: pointer;
+  border: 1px solid var(--accent); background: var(--accent-soft); color: var(--text);
+  font: inherit; font-weight: 600; font-size: 15px;
+  transition: background 0.16s ease, transform 0.16s ease;
+}
+.new-chat:hover { background: rgba(10, 132, 255, 0.3); }
+.new-chat:active { transform: scale(0.98); }
+.side-search input {
+  width: 100%; min-height: 42px; padding: 10px 13px; border-radius: 13px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  font: inherit; font-size: 15px; outline: none;
+  transition: border-color 0.16s ease;
+}
+.side-search input::placeholder { color: var(--muted); }
+.side-search input:focus { border-color: var(--accent); }
+.chat-list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; display: flex; flex-direction: column; gap: 4px; padding-right: 2px; }
+.chat-empty { color: var(--muted); font-size: 14px; line-height: 1.5; padding: 18px 8px; margin: 0; }
+.chat-item {
+  display: flex; align-items: center; gap: 6px; border-radius: 13px;
+  border: 1px solid transparent;
+  transition: background 0.16s ease;
+}
+.chat-item:hover { background: var(--surface); }
+.chat-item.active { background: var(--accent-soft); border-color: rgba(10, 132, 255, 0.45); }
+.chat-open {
+  flex: 1; min-width: 0; text-align: left; background: none; border: 0; color: var(--text);
+  padding: 10px; cursor: pointer; font: inherit;
+}
+.chat-title {
+  display: block; font-size: 14px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.chat-preview {
+  display: block; font-size: 12px; color: var(--muted); margin-top: 2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.chat-mode-tag {
+  display: inline-block; margin-right: 5px; font-size: 10px; vertical-align: 1px;
+  color: var(--accent);
+}
+.chat-mode-tag.smith { color: var(--smith); }
+.chat-mode-tag.group { color: #bf5af2; }
+.chat-delete,
+.chat-action {
+  width: 32px; height: 32px; flex-shrink: 0; border-radius: 9px; border: 0;
+  background: transparent; color: var(--muted); font-size: 15px; cursor: pointer;
+}
+.chat-delete:hover { background: rgba(255, 69, 58, 0.2); color: var(--error); }
+.chat-action:hover { background: var(--surface-strong); color: var(--text); }
+.side-foot {
+  font-size: 12px; color: var(--muted); padding: 10px 6px 0;
+  border-top: 1px solid var(--border);
+}
+.scrim { position: fixed; inset: 0; background: rgba(3, 3, 8, 0.6); z-index: 35; animation: fade-in 0.2s ease both; }
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+
+/* ---------- главный блок ---------- */
+.main { flex: 1; min-width: 0; display: flex; flex-direction: column; height: 100%; position: relative; }
+.topbar {
+  display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+  border-bottom: 1px solid transparent;
+  background: linear-gradient(to bottom, rgba(5, 5, 8, 0.82), rgba(5, 5, 8, 0));
+  position: relative; z-index: 20;
+}
+html[data-theme="light"] .topbar {
+  background: linear-gradient(to bottom, rgba(238, 241, 248, 0.85), rgba(238, 241, 248, 0));
+}
+.brand { display: flex; align-items: center; gap: 9px; min-width: 0; margin-left: 2px; }
+.model-pill {
+  font-size: 11px; font-weight: 600; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 999px; padding: 3px 8px; white-space: nowrap;
+}
+.top-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+
+/* ---------- чат ---------- */
+.chat { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 18px 14px 8px; overscroll-behavior: contain; }
+.welcome { max-width: 680px; margin: 4vh auto 0; text-align: center; animation: welcome-in 0.55s cubic-bezier(0.22, 0.8, 0.32, 1) both; }
+@keyframes welcome-in { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: none; } }
+.welcome-card {
+  background: linear-gradient(160deg, rgba(30, 36, 70, 0.55), rgba(16, 14, 34, 0.55));
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  padding: 26px 22px 22px;
+}
+html[data-theme="light"] .welcome-card {
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.9), rgba(235, 238, 252, 0.9));
+}
+.orb {
+  width: 84px; height: 84px; margin: 0 auto 18px; border-radius: 50%;
+  background: conic-gradient(from 0deg, #ff3b30, #ff9500, #ffcc00, #34c759, #00c7be, #0a84ff, #5e5ce6, #ff2d92, #ff3b30);
+  filter: blur(2px) saturate(1.1); opacity: 0.9;
+  animation: spin 14s linear infinite;
+  box-shadow: 0 0 60px rgba(90, 120, 255, 0.4);
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.welcome h1 { font-size: clamp(26px, 6vw, 38px); line-height: 1.12; letter-spacing: -0.03em; margin: 0 0 12px; }
+.welcome p { color: var(--muted); font-size: 15px; line-height: 1.6; max-width: 520px; margin: 0 auto; }
+.suggestions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 22px; }
+.suggestion {
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  border-radius: 999px; padding: 10px 16px; font: inherit; font-size: 13.5px; line-height: 1.35;
+  cursor: pointer;
+  transition: background 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+}
+.suggestion:hover { background: var(--surface-strong); border-color: var(--accent); transform: translateY(-2px); }
+.suggestion:active { transform: scale(0.97); }
+.messages { max-width: 760px; margin: 0 auto; width: 100%; }
+
+/* сообщения */
+.message {
+  display: flex; gap: 10px; margin: 16px 0; align-items: flex-start;
+  animation: message-in 0.3s cubic-bezier(0.22, 0.8, 0.32, 1) both;
+}
+@keyframes message-in { from { opacity: 0; transform: translateY(12px) scale(0.99); } to { opacity: 1; transform: none; } }
+.message.user { justify-content: flex-end; }
+.message .avatar {
+  width: 32px; height: 32px; flex-shrink: 0; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center; font-size: 15px;
+  background: var(--surface-strong); border: 1px solid var(--border);
+}
+.message .avatar.siri { background: radial-gradient(circle at 30% 30%, #4ab8ff, #0a84ff 55%, #5e5ce6); border-color: rgba(10, 132, 255, 0.6); }
+.message .avatar.smith { background: radial-gradient(circle at 30% 30%, #ffd089, #ff9500 60%, #c93400); border-color: rgba(255, 149, 0, 0.6); }
+.bubble-wrap { max-width: 86%; min-width: 0; }
+.message.user .bubble-wrap { max-width: 82%; }
+.bubble {
+  padding: 12px 15px; border-radius: 20px; font-size: 16px; line-height: 1.55;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  background: var(--surface); border: 1px solid var(--border);
+  transition: box-shadow 0.3s ease, border-color 0.3s ease;
+}
+.message.user .bubble {
+  background: var(--accent); border-color: transparent; color: #fff;
+  border-bottom-right-radius: 6px;
+}
+.message.ai .bubble { border-bottom-left-radius: 6px; }
+.bubble.streaming {
+  box-shadow: 0 0 0 1px rgba(10, 132, 255, 0.22), 0 12px 38px rgba(10, 132, 255, 0.1);
+}
+.bubble.streaming.smith-stream {
+  box-shadow: 0 0 0 1px rgba(255, 149, 0, 0.25), 0 12px 38px rgba(255, 149, 0, 0.1);
+}
+.bubble.streaming.has-text::after {
+  content: "▍"; margin-left: 2px; color: var(--accent);
+  animation: caret 0.9s steps(1) infinite;
+}
+.bubble.streaming.smith-stream.has-text::after { color: var(--smith); }
+@keyframes caret { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+.typing-dots { display: inline-flex; align-items: center; gap: 5px; padding: 4px 2px; }
+.typing-dots span { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: blink 1.2s infinite; }
+.typing-dots span:nth-child(2) { animation-delay: 0.18s; }
+.typing-dots span:nth-child(3) { animation-delay: 0.36s; }
+.message.streaming .avatar { animation: avatar-pulse 1.8s ease-in-out infinite; }
+@keyframes avatar-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(10, 132, 255, 0); }
+  50% { box-shadow: 0 0 0 7px rgba(10, 132, 255, 0.16); }
+}
+.message.streaming .avatar.smith { animation: avatar-pulse-smith 1.8s ease-in-out infinite; }
+@keyframes avatar-pulse-smith {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 149, 0, 0); }
+  50% { box-shadow: 0 0 0 7px rgba(255, 149, 0, 0.18); }
+}
+.message.error .bubble { border-color: rgba(255, 69, 58, 0.5); color: var(--error); }
+.msg-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 3px; }
+.msg-name { font-size: 12px; font-weight: 700; color: var(--muted); }
+.msg-name.siri { color: #4ab8ff; }
+.msg-name.smith { color: var(--smith); }
+.msg-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.msg-actions button {
+  border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 12px;
+  padding: 5px 9px; border-radius: 8px; cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.msg-actions button:hover { background: var(--surface); color: var(--text); }
+.msg-actions .rate-btn { font-size: 15px; opacity: 0.72; }
+.msg-actions .rate-btn.active {
+  opacity: 1; background: var(--accent-soft); color: var(--text);
+  box-shadow: inset 0 0 0 1px rgba(10, 132, 255, 0.5);
+}
+.reply-btn {
+  border: 1px solid var(--border) !important; border-radius: 999px !important;
+  font-weight: 600; color: var(--accent);
+}
+.reply-btn:hover { color: var(--accent); border-color: var(--accent) !important; }
+.tg-link { color: var(--accent); font-weight: 600; text-decoration: none; }
+.tg-link:hover { text-decoration: underline; }
+.sources { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.source-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  max-width: 100%; padding: 5px 10px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface);
+  color: var(--muted); font-size: 12px; text-decoration: none;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+.source-chip:hover { border-color: var(--accent); color: var(--text); }
+.source-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-banner {
+  display: flex; align-items: center; gap: 8px; margin: 14px 0 0;
+  padding: 8px 12px; border-radius: 12px; font-size: 13px; color: var(--muted);
+  background: var(--surface); border: 1px dashed var(--border);
+  animation: fade-in 0.25s ease both;
+}
+.search-banner svg { flex-shrink: 0; color: var(--accent); }
+
+/* ---------- кнопка «вниз» ---------- */
+.jump-down {
+  position: absolute; left: 50%; bottom: 104px; transform: translateX(-50%) scale(0.9);
+  width: 42px; height: 42px; border-radius: 50%;
+  border: 1px solid var(--border); background: rgba(20, 20, 30, 0.85);
+  color: var(--text); cursor: pointer; z-index: 15;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: var(--shadow);
+  opacity: 0; pointer-events: none;
+  transition: opacity 0.22s ease, transform 0.22s ease;
+  backdrop-filter: blur(10px);
+}
+.jump-down.show { opacity: 1; pointer-events: auto; transform: translateX(-50%) scale(1); }
+.jump-down:active { transform: translateX(-50%) scale(0.9); }
+html[data-theme="light"] .jump-down { background: rgba(255, 255, 255, 0.9); }
+
+/* ---------- композер ---------- */
+.composer {
+  padding: 8px 12px calc(12px + env(safe-area-inset-bottom));
+  position: relative; z-index: 20;
+}
+.reply-chip {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  max-width: 760px; margin: 0 auto 8px; padding: 8px 8px 8px 14px;
+  background: var(--accent-soft); border: 1px solid rgba(10, 132, 255, 0.45);
+  border-radius: 12px; font-size: 13px; color: var(--text);
+  animation: chip-in 0.22s cubic-bezier(0.22, 0.8, 0.32, 1) both;
+}
+@keyframes chip-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.reply-chip span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reply-chip button {
+  border: 0; background: transparent; color: var(--muted); font-size: 15px; cursor: pointer;
+  width: 28px; height: 28px; border-radius: 8px; flex-shrink: 0;
+}
+.reply-chip button:hover { color: var(--text); }
+.composer-inner {
+  max-width: 760px; margin: 0 auto; display: flex; align-items: flex-end; gap: 6px;
+  background: rgba(24, 24, 32, 0.92); border: 1px solid var(--border); border-radius: 26px;
+  padding: 6px 6px 6px 6px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+html[data-theme="light"] .composer-inner { background: rgba(255, 255, 255, 0.92); }
+.composer-inner:focus-within { border-color: var(--accent); box-shadow: 0 10px 44px rgba(10, 132, 255, 0.14); }
+#input {
+  flex: 1; min-width: 0; resize: none; max-height: 160px; border: 0; outline: 0;
+  background: transparent; color: var(--text); font: inherit; font-size: 16px;
+  line-height: 1.45; padding: 11px 4px;
+}
+#input::placeholder { color: var(--muted); }
+.plus-btn, .mic-btn {
+  width: 42px; height: 42px; flex-shrink: 0; border-radius: 50%;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  transition: background 0.16s ease, transform 0.16s ease, border-color 0.16s ease;
+}
+.plus-btn:hover, .mic-btn:hover { background: var(--surface-strong); transform: scale(1.05); }
+.plus-btn:active, .mic-btn:active { transform: scale(0.92); }
+.mic-btn.live-on {
+  background: var(--accent); border-color: transparent; color: #fff;
+  animation: mic-pulse 1.6s ease-in-out infinite;
+}
+@keyframes mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(10, 132, 255, 0.45); }
+  50% { box-shadow: 0 0 0 9px rgba(10, 132, 255, 0); }
+}
+.send {
+  width: 42px; height: 42px; flex-shrink: 0; border: 0; border-radius: 50%;
+  background: var(--accent); color: #fff; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: transform 0.16s ease, opacity 0.16s ease, background 0.16s ease;
+}
+.send:hover { transform: scale(1.06); }
+.send:active { transform: scale(0.92); }
+.send:disabled { opacity: 0.45; cursor: default; transform: none; }
+
+/* ---------- режим Live ---------- */
+.live-overlay {
+  position: absolute; inset: 0; z-index: 30;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+  background: rgba(5, 5, 10, 0.82);
+  backdrop-filter: blur(18px);
+  animation: fade-in 0.25s ease both;
+  cursor: pointer;
+}
+.live-orb {
+  width: 120px; height: 120px; border-radius: 50%;
+  background: conic-gradient(from 0deg, #ff3b30, #ff9500, #ffcc00, #34c759, #00c7be, #0a84ff, #5e5ce6, #ff2d92, #ff3b30);
+  filter: blur(3px) saturate(1.15);
+  animation: spin 6s linear infinite, orb-breathe 3s ease-in-out infinite;
+  box-shadow: 0 0 90px rgba(10, 132, 255, 0.5);
+}
+@keyframes orb-breathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.08); } }
+.live-text { font-size: 18px; font-weight: 600; text-align: center; padding: 0 24px; }
+.live-sub { font-size: 13px; color: var(--muted); }
+
+/* ---------- настройки ---------- */
+.modal { position: fixed; inset: 0; z-index: 60; display: flex; align-items: flex-end; justify-content: center; background: rgba(3, 3, 8, 0.62); backdrop-filter: blur(5px); animation: fade-in 0.18s ease both; }
+.modal-card {
+  position: relative; width: 100%; max-width: 480px; max-height: 88vh; overflow-y: auto;
+  background: #14141f; border: 1px solid var(--border); border-radius: 22px 22px 0 0;
+  padding: 22px 18px calc(22px + env(safe-area-inset-bottom)); box-shadow: var(--shadow);
+  animation: modal-up 0.3s cubic-bezier(0.22, 0.8, 0.32, 1) both;
+}
+@keyframes modal-up { from { opacity: 0; transform: translateY(32px); } to { opacity: 1; transform: none; } }
+html[data-theme="light"] .modal-card { background: #fff; }
+.modal-card h2 { margin: 0 0 8px; font-size: 20px; }
+.modal-close { position: absolute; top: 14px; right: 14px; }
+.setting-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 15px 0; border-top: 1px solid var(--border); }
+.setting-label { font-size: 15px; font-weight: 600; }
+.setting-desc { margin: 4px 0 0; font-size: 12.5px; color: var(--muted); line-height: 1.45; }
+.switch { position: relative; width: 48px; height: 28px; flex-shrink: 0; }
+.switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.switch-track { position: absolute; inset: 0; border-radius: 14px; background: rgba(255,255,255,0.18); border: 1px solid var(--border); cursor: pointer; transition: background 0.2s; }
+.switch-track::before { content: ""; position: absolute; top: 2px; left: 2px; width: 22px; height: 22px; border-radius: 50%; background: #fff; transition: transform 0.2s; box-shadow: 0 1px 4px rgba(0,0,0,0.3); }
+.switch input:checked + .switch-track { background: var(--accent); }
+.switch input:checked + .switch-track::before { transform: translateX(20px); }
+.switch input:focus-visible + .switch-track { outline: 2px solid var(--accent); outline-offset: 2px; }
+.select-wrap { flex-shrink: 0; max-width: 58%; }
+.setting-select {
+  appearance: none; -webkit-appearance: none;
+  min-height: 40px; max-width: 100%; padding: 8px 28px 8px 12px;
+  border-radius: 12px; border: 1px solid var(--border);
+  background-color: var(--surface); color: var(--text);
+  font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 14px) 50%, calc(100% - 9px) 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+.setting-select:focus { border-color: var(--accent); }
+.bio-row { display: flex; flex-direction: column; gap: 8px; padding: 2px 0 14px; }
+.bio-row textarea {
+  width: 100%; min-height: 96px; resize: vertical; outline: none;
+  padding: 10px 12px; border-radius: 12px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  font: inherit; font-size: 14px; line-height: 1.5;
+}
+.bio-row textarea:focus { border-color: var(--accent); }
+.bio-row textarea::placeholder { color: var(--muted); }
+.about { margin-top: 18px; padding: 14px; border-radius: 14px; background: var(--surface); border: 1px solid var(--border); }
+.about p { margin: 6px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.toast {
+  position: fixed; left: 50%; bottom: 118px; transform: translateX(-50%); z-index: 70;
+  background: #1d1d2a; color: #fff; border: 1px solid var(--border);
+  border-radius: 12px; padding: 10px 16px; font-size: 13.5px; box-shadow: var(--shadow);
+  max-width: min(86vw, 420px); text-align: center;
+  animation: toast-in 0.22s cubic-bezier(0.22, 0.8, 0.32, 1) both;
+}
+@keyframes toast-in { from { opacity: 0; transform: translate(-50%, 12px); } to { opacity: 1; transform: translate(-50%, 0); } }
+html[data-theme="light"] .toast { background: #1d1d2a; }
+
+/* ---------- не найдено ---------- */
+.notfound { max-width: 560px; margin: 18vh auto 0; padding: 0 20px; text-align: center; }
+.notfound h1 { font-size: 28px; margin: 14px 0 10px; }
+.notfound p { color: var(--muted); line-height: 1.6; }
+.home-link { display: inline-block; margin-top: 16px; padding: 12px 20px; border-radius: 14px; background: var(--accent); color: #fff; text-decoration: none; font-weight: 600; }
+
+/* ---------- аккаунт ---------- */
+.account-link {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: 40px; padding: 0 14px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface);
+  color: var(--text); font-size: 14px; font-weight: 600; text-decoration: none;
+  white-space: nowrap;
+}
+.account-link:hover { background: var(--surface-strong); }
+.mini-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: 36px; padding: 0 13px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--surface-strong);
+  color: var(--text); font: inherit; font-size: 13px; font-weight: 600;
+  text-decoration: none; cursor: pointer; white-space: nowrap;
+}
+.mini-btn:hover { background: var(--surface); }
+
+/* ---------- большие экраны ---------- */
+@media (min-width: 900px) {
+  .sidebar { position: relative; transform: none; width: 300px; background: rgba(10, 10, 16, 0.6); }
+  .side-close, .menu-btn, .scrim { display: none !important; }
+  .topbar { padding: 12px 22px; }
+  .modal { align-items: center; }
+  .modal-card { border-radius: 22px; }
+  .chat { padding: 26px 28px 14px; }
+  .composer { padding: 10px 22px 16px; }
+  .bubble-wrap { max-width: 78%; }
+  .jump-down { bottom: 118px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}
+html[data-font-size="large"] .bubble { font-size: 18px; }
+::selection { background: rgba(10, 132, 255, 0.4); }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.16); border-radius: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ---------- бейдж «включён» ---------- */
+.on-pill {
+  display: inline-flex; align-items: center; gap: 2px; flex-shrink: 0;
+  padding: 5px 11px; border-radius: 999px; font-size: 12px; font-weight: 600;
+  color: var(--success); background: rgba(50, 215, 75, 0.12);
+  border: 1px solid rgba(50, 215, 75, 0.35); white-space: nowrap;
+}
+.on-pill .dot { margin-right: 2px; }
+
+/* ---------- страница исходников ---------- */
+.source-page { max-width: 960px; margin: 0 auto; padding: 24px 16px 64px; }
+.source-back { display: inline-block; margin-bottom: 18px; color: var(--muted); font-size: 13px; text-decoration: none; }
+.source-back:hover { color: var(--text); }
+.source-head { display: flex; align-items: center; gap: 10px; }
+.source-page h1 { margin: 10px 0; font-size: clamp(26px, 7vw, 38px); letter-spacing: -0.02em; }
+.source-page h2 { margin: 34px 0 12px; font-size: 20px; letter-spacing: -0.01em; }
+.source-lead { margin: 0; max-width: 720px; color: var(--muted); font-size: 15px; line-height: 1.6; }
+.source-stack { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.source-card { padding: 16px; border-radius: 16px; border: 1px solid var(--border); background: var(--surface); }
+.source-card h3 { margin: 0 0 6px; font-size: 15px; }
+.source-card p { margin: 0; font-size: 13.5px; line-height: 1.5; color: var(--muted); }
+.source-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 24px; }
+.source-download {
+  display: inline-flex; align-items: center; justify-content: center; min-height: 44px;
+  padding: 0 18px; border-radius: 13px; background: var(--accent); color: #fff;
+  border: 1px solid transparent; font: inherit; font-size: 14px; font-weight: 600;
+  text-decoration: none; cursor: pointer; transition: transform 0.16s ease, background 0.16s ease;
+}
+.source-download:hover { opacity: 0.92; transform: translateY(-1px); }
+.source-download:active { transform: scale(0.98); }
+.source-download:disabled { opacity: 0.6; cursor: default; transform: none; }
+.source-ghost { background: var(--surface); color: var(--text); border-color: var(--border); }
+.source-ghost:hover { background: var(--surface-strong); border-color: var(--accent); opacity: 1; }
+.source-meta { color: var(--muted); font-size: 12.5px; }
+.source-link { margin: 10px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.source-link a { color: var(--accent); font-weight: 600; text-decoration: none; }
+.source-link a:hover { text-decoration: underline; }
+.source-note { margin: 0 0 14px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.source-empty { color: var(--muted); font-size: 14px; }
+.source-full {
+  margin: 16px 0 0; padding: 16px; max-height: 72vh; overflow: auto;
+  border: 1px solid var(--border); border-radius: 14px;
+  background: rgba(0, 0, 0, 0.32); font-size: 12.5px; line-height: 1.55;
+  scroll-margin-top: 16px;
+}
+html[data-theme="light"] .source-full { background: rgba(20, 30, 60, 0.05); }
+.source-full code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre; }
+
+/* ==================== [20/25] assets/js/lightning.js ==================== */
+
+/* ============================================================================
+   LIGHTNING GRAPHICS ENGINE — собственная разработка Imagination Technology.
+
+   Основной путь — WebGPU (WGSL): в Safari на Apple он транслируется напрямую
+   в Metal. Оптимизации под этот бэкенд:
+   • поддержка shader-f16 проверяется через adapter.features, и при наличии
+     данные частиц хранятся как vec4<f16> — вдвое меньше памяти (критично
+     для iOS);
+   • Render Bundles (в Metal — indirect command buffers) используются для
+     повторяющихся draw-вызовов: сцена записывается один раз и переигрывается;
+   • обновления буферов минимизированы: один writeBuffer на кадр (uniform),
+     индексный и storage-буферы не трогаются вовсе.
+
+   Фолбэк — WebGL 2.0 (GLSL ES 3.0) через низкоуровневый API LightningGL
+   (см. ниже): тот же API-стиль, что Metal или Vulkan, поверх чистого WebGL.
+   Работает на iPhone SE / iOS 15 / Safari.
+
+   Для вычислений на GPU в WebGL-пути используется Transform Feedback:
+   вершины «прогоняются» с выключенным растеризатором, результаты пишутся
+   в буфер — аналог compute-прохода Metal.
+   ============================================================================ */
+
+(() => {
+  "use strict";
+
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* ==========================================================================
+     ЧАСТЬ 1. Низкоуровневый графический API поверх WebGL 2.0 — LightningGL.
+     Архитектура как в Metal:
+       Device        — создание буферов, шейдеров, пайплайнов, командных буферов
+       Buffer        — vertex / index / uniform / storage; upload, read, destroy
+       Shader        — вершинный + фрагментный, поддержка TF-varyings
+       Pipeline      — атрибуты, uniform-локации, состояния (depth, cull, blend)
+       CommandBuffer — begin/end, setPipeline, setVertexBuffer, setUniform,
+                       dispatch (Transform Feedback), draw, clear, submit
+       RenderPass    — обёртка над draw-вызовами
+       ComputePass   — обёртка над Transform Feedback (аналог compute в Metal)
+     WebGL-шум (bindBuffer, vertexAttribPointer, …) спрятан внутри API.
+     ========================================================================== */
+
+  class Buffer {
+    constructor(device, { type = "vertex", usage = "dynamic", data = null }) {
+      this.device = device;
+      this.type = type; // vertex | index | uniform | storage
+      this.usage = usage; // static | dynamic | stream
+      this.target = type === "index" ? device.gl.ELEMENT_ARRAY_BUFFER : device.gl.ARRAY_BUFFER;
+      this._id = device.gl.createBuffer();
+      if (data) this.upload(data);
+    }
+    get id() { return this._id; }
+    upload(data) {
+      const gl = this.device.gl;
+      gl.bindBuffer(this.target, this._id);
+      const hint = this.usage === "static" ? gl.STATIC_DRAW : this.usage === "stream" ? gl.STREAM_DRAW : gl.DYNAMIC_DRAW;
+      gl.bufferData(this.target, data, hint);
+    }
+    // Чтение результатов вычислений обратно в JS (getBufferSubData).
+    read(count) {
+      const gl = this.device.gl;
+      const out = new Float32Array(count);
+      gl.bindBuffer(this.target, this._id);
+      gl.getBufferSubData(this.target, 0, out);
+      return out;
+    }
+    destroy() {
+      this.device.gl.deleteBuffer(this._id);
+      this._id = null;
+    }
+  }
+
+  class Shader {
+    constructor(device, { vertexSource, fragmentSource, varyings = [] }) {
+      const gl = device.gl;
+      this.device = device;
+      const compile = (type, source) => {
+        const sh = gl.createShader(type);
+        gl.shaderSource(sh, source);
+        gl.compileShader(sh);
+        if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+          const log = gl.getShaderInfoLog(sh);
+          gl.deleteShader(sh);
+          throw new Error("shader: " + log);
+        }
+        return sh;
+      };
+      this._program = gl.createProgram();
+      gl.attachShader(this._program, compile(gl.VERTEX_SHADER, vertexSource));
+      gl.attachShader(this._program, compile(gl.FRAGMENT_SHADER, fragmentSource));
+      // Transform Feedback varyings: что вершинный шейдер отдаст в буфер.
+      if (varyings.length) gl.transformFeedbackVaryings(this._program, varyings, gl.SEPARATE_ATTRIBS);
+      gl.linkProgram(this._program);
+      if (!gl.getProgramParameter(this._program, gl.LINK_STATUS)) {
+        const log = gl.getProgramInfoLog(this._program);
+        gl.deleteProgram(this._program);
+        throw new Error("link: " + log);
+      }
+      this._uniforms = new Map();
+      this._attribs = new Map();
+    }
+    get program() { return this._program; }
+    uniform(name) {
+      if (!this._uniforms.has(name)) this._uniforms.set(name, this.device.gl.getUniformLocation(this._program, name));
+      return this._uniforms.get(name);
+    }
+    attrib(name) {
+      if (!this._attribs.has(name)) this._attribs.set(this.device.gl.getAttribLocation(this._program, name));
+      return this._attribs.get(name);
+    }
+    destroy() {
+      this.device.gl.deleteProgram(this._program);
+      this._program = null;
+    }
+  }
+
+  class Pipeline {
+    // Состояния как в Metal: depth test, cull mode, blend — часть пайплайна.
+    constructor(device, { shader, attributes = [], depthTest = false, depthWrite = true, cullMode = "none", blend = false }) {
+      this.device = device;
+      this.shader = shader;
+      this.attributes = attributes; // [{ name, size, stride, offset }]
+      this.depthTest = depthTest;
+      this.depthWrite = depthWrite;
+      this.cullMode = cullMode; // none | back | front
+      this.blend = blend;
+      this._bound = null;
+    }
+    _bind(vertexBuffers) {
+      const gl = this.device.gl;
+      gl.useProgram(this.shader.program);
+      if (this.depthTest) gl.enable(gl.DEPTH_TEST);
+      else gl.disable(gl.DEPTH_TEST);
+      gl.depthMask(this.depthWrite);
+      if (this.cullMode === "none") gl.disable(gl.CULL_FACE);
+      else {
+        gl.enable(gl.CULL_FACE);
+        gl.cullFace(this.cullMode === "back" ? gl.BACK : gl.FRONT);
+      }
+      if (this.blend) {
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE); // аддитивное свечение
+      } else gl.disable(gl.BLEND);
+      let unit = 0;
+      const buffers = vertexBuffers || [];
+      for (const attr of this.attributes) {
+        const loc = this.shader.attrib(attr.name);
+        if (loc < 0) continue;
+        const buffer = buffers[unit];
+        if (!buffer) continue;
+        gl.bindBuffer(buffer.target, buffer.id);
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, attr.size, gl.FLOAT, false, attr.stride || 0, attr.offset || 0);
+        unit += 1;
+      }
+      this._bound = true;
+    }
+    destroy() { this.shader.destroy(); }
+  }
+
+  class CommandBuffer {
+    // Порядок команд управляется вручную: записал → submit() выполнил.
+    constructor(device) {
+      this.device = device;
+      this._commands = [];
+      this._recording = false;
+    }
+    begin() { this._commands = []; this._recording = true; return this; }
+    setPipeline(pipeline) {
+      this._commands.push(() => pipeline._bind(this._vertexBuffers || []));
+      this._pipeline = pipeline;
+      return this;
+    }
+    setVertexBuffer(buffer, binding = 0) {
+      (this._vertexBuffers || (this._vertexBuffers = []))[binding] = buffer;
+      return this;
+    }
+    setIndexBuffer(buffer) { this._indexBuffer = buffer; return this; }
+    setUniform(name, value) {
+      const pipeline = this._pipeline;
+      const gl = this.device.gl;
+      this._commands.push(() => {
+        const loc = pipeline.shader.uniform(name);
+        if (loc === null) return;
+        if (typeof value === "number") gl.uniform1f(loc, value);
+        else if (value.length === 1) gl.uniform1f(loc, value[0]);
+        else if (value.length === 2) gl.uniform2f(loc, value[0], value[1]);
+        else if (value.length === 3) gl.uniform3f(loc, value[0], value[1], value[2]);
+        else if (value.length === 4) gl.uniform4f(loc, value[0], value[1], value[2], value[3]);
+      });
+      return this;
+    }
+    clear({ r = 0, g = 0, b = 0, a = 0 } = {}) {
+      const gl = this.device.gl;
+      this._commands.push(() => {
+        gl.clearColor(r, g, b, a);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      });
+      return this;
+    }
+    // Compute-проход: вершины считаются с выключенным растеризатором,
+    // результаты пишутся в storage-буфер через Transform Feedback.
+    dispatch({ vertices, bindings }) {
+      const gl = this.device.gl;
+      const pipeline = this._pipeline;
+      const targets = bindings;
+      this._commands.push(() => {
+        gl.enable(gl.RASTERIZER_DISCARD);
+        for (let i = 0; i < targets.length; i += 1) gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, i, targets[i].id);
+        gl.beginTransformFeedback(gl.POINTS);
+        gl.drawArrays(gl.POINTS, 0, vertices);
+        gl.endTransformFeedback();
+        gl.disable(gl.RASTERIZER_DISCARD);
+        for (let i = 0; i < targets.length; i += 1) gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, i, null);
+      });
+      return this;
+    }
+    draw({ first = 0, count }) {
+      const gl = this.device.gl;
+      this._commands.push(() => gl.drawArrays(gl.POINTS, first, count));
+      return this;
+    }
+    drawIndexed({ count }) {
+      const gl = this.device.gl;
+      const buffer = this._indexBuffer;
+      this._commands.push(() => {
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffer.id);
+        gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, 0);
+      });
+      return this;
+    }
+    end() { this._recording = false; return this; }
+    submit() {
+      if (this._recording) this.end();
+      for (const command of this._commands) command();
+      this._commands = [];
+      this._vertexBuffers = null;
+      return this;
+    }
+  }
+
+  // Обёртки-проходы: render — рисование, compute — вычисления через TF.
+  class RenderPass {
+    constructor(commandBuffer, { clear } = {}) {
+      this.cmd = commandBuffer;
+      if (clear) this.cmd.clear(clear);
+    }
+    setPipeline(p) { this.cmd.setPipeline(p); return this; }
+    setVertexBuffer(b, i) { this.cmd.setVertexBuffer(b, i); return this; }
+    setUniform(n, v) { this.cmd.setUniform(n, v); return this; }
+    draw(opts) { this.cmd.draw(opts); return this; }
+    end() { return this; }
+  }
+  class ComputePass {
+    constructor(commandBuffer) { this.cmd = commandBuffer; }
+    setPipeline(p) { this.cmd.setPipeline(p); return this; }
+    setVertexBuffer(b, i) { this.cmd.setVertexBuffer(b, i); return this; }
+    setUniform(n, v) { this.cmd.setUniform(n, v); return this; }
+    dispatch(opts) { this.cmd.dispatch(opts); return this; }
+    end() { return this; }
+  }
+
+  class Device {
+    constructor(canvas) {
+      this.canvas = canvas;
+      this.gl = canvas.getContext("webgl2", {
+        alpha: true, antialias: false, depth: true,
+        premultipliedAlpha: true, powerPreference: "low-power",
+      });
+      if (!this.gl) throw new Error("no webgl2");
+      this.gl.getExtension("EXT_color_buffer_float");
+    }
+    createBuffer(opts) { return new Buffer(this, opts); }
+    createShader(opts) { return new Shader(this, opts); }
+    createPipeline(opts) { return new Pipeline(this, opts); }
+    createCommandBuffer() { return new CommandBuffer(this); }
+    createRenderPass(cmd, opts) { return new RenderPass(cmd, opts); }
+    createComputePass(cmd) { return new ComputePass(cmd); }
+    resize(w, h) {
+      this.canvas.width = w;
+      this.canvas.height = h;
+      this.gl.viewport(0, 0, w, h);
+    }
+    destroy() {
+      const lose = this.gl.getExtension("WEBGL_lose_context");
+      if (lose) lose.loseContext();
+      this.gl = null;
+    }
+  }
+
+  // Публичный низкоуровневый API: window.LightningGL
+  window.LightningGL = { Device, Buffer, Shader, Pipeline, CommandBuffer, RenderPass, ComputePass };
+
+  /* ==========================================================================
+     ЧАСТЬ 2. Сцена для WebGL 2.0 — частицы, посчитанные на GPU через TF.
+     ========================================================================== */
+
+  const COUNT = 900;
+
+  const COMPUTE_VS = `#version 300 es
+  precision highp float;
+  in vec4 aData;            // x, y, vx, vy
+  uniform float uDt;
+  uniform float uTime;
+  uniform vec2 uPointer;
+  out vec4 vData;
+  void main() {
+    vec2 p = aData.xy;
+    vec2 v = aData.zw;
+    vec2 toC = -p;
+    float d = length(p) + 0.0001;
+    vec2 acc = toC * (0.32 / (d * 0.4 + 0.35));
+    acc += vec2(-p.y, p.x) * 0.4;                              // вихрь вокруг центра
+    acc += vec2(sin(uTime * 0.7 + p.x * 3.1), cos(uTime * 0.6 + p.y * 2.9)) * 0.1;
+    vec2 toM = uPointer - p;
+    float md = length(toM) + 0.0001;
+    acc += toM / md * (0.5 / (md * 0.06 + 1.0));              // лёгкое притяжение к пальцу
+    v += acc * uDt;
+    v *= 0.985;
+    p += v * uDt;
+    if (p.x > 1.3) p.x = -1.3; if (p.x < -1.3) p.x = 1.3;
+    if (p.y > 1.3) p.y = -1.3; if (p.y < -1.3) p.y = 1.3;
+    vData = vec4(p, v);
+  }`;
+
+  // Фрагментный шейдер для compute-пасса: растеризация выключена
+  // (RASTERIZER_DISCARD), поэтому здесь пустой main. Отдельный от RENDER_FS,
+  // чтобы не тянуть его varying-входы (vSpeed, vDepth) в compute-программу.
+  const COMPUTE_FS = `#version 300 es
+  precision mediump float;
+  out vec4 outColor;
+  void main() { outColor = vec4(0.0); }`;
+
+  const RENDER_VS = `#version 300 es
+  precision highp float;
+  in vec4 aData;
+  uniform vec2 uRes;
+  out float vSpeed;
+  out float vDepth;
+  void main() {
+    vec2 p = aData.xy;
+    vSpeed = length(aData.zw);
+    vDepth = clamp((1.25 - length(p)) * 0.85, 0.0, 1.0);
+    vec2 clip = p / vec2(uRes.y / uRes.x, 1.0);
+    gl_Position = vec4(clip, 0.0, 1.0);
+    gl_PointSize = 1.4 + vSpeed * 1.1;
+  }`;
+
+  const RENDER_FS = `#version 300 es
+  precision highp float;
+  in float vSpeed;
+  in float vDepth;
+  out vec4 outColor;
+  void main() {
+    vec2 c = gl_PointCoord - 0.5;
+    float r = length(c);
+    if (r > 0.5) discard;
+    float glow = smoothstep(0.5, 0.0, r);
+    vec3 cool = vec3(0.15, 0.45, 1.0);
+    vec3 warm = vec3(0.85, 0.35, 0.95);
+    vec3 color = mix(cool, warm, clamp(vSpeed * 0.8, 0.0, 1.0));
+    outColor = vec4(color, glow * glow * (0.28 + vDepth * 0.35));
+  }`;
+
+  function seedParticles() {
+    const data = new Float32Array(COUNT * 4);
+    for (let i = 0; i < COUNT; i += 1) {
+      const angle = Math.random() * Math.PI * 2;
+      const radius = 0.15 + Math.random() * 1.05;
+      data[i * 4] = Math.cos(angle) * radius;
+      data[i * 4 + 1] = Math.sin(angle) * radius;
+      data[i * 4 + 2] = (Math.random() - 0.5) * 0.1;
+      data[i * 4 + 3] = (Math.random() - 0.5) * 0.1;
+    }
+    return data;
+  }
+
+  function runWebGL2(canvas) {
+    const device = new window.LightningGL.Device(canvas);
+    const gl = device.gl;
+
+    // Двойная пара буферов: чтение → запись, потом наоборот (ping-pong).
+    const data = seedParticles();
+    const buffers = [device.createBuffer({ type: "storage", usage: "dynamic", data }), device.createBuffer({ type: "storage", usage: "dynamic", data: data.slice() })];
+
+    const computeShader = device.createShader({ vertexSource: COMPUTE_VS, fragmentSource: COMPUTE_FS, varyings: ["vData"] });
+    const computePipeline = device.createPipeline({
+      shader: computeShader,
+      attributes: [{ name: "aData", size: 4, stride: 16, offset: 0 }],
+      depthTest: false, blend: false,
+    });
+
+    const renderShader = device.createShader({ vertexSource: RENDER_VS, fragmentSource: RENDER_FS });
+    const renderPipeline = device.createPipeline({
+      shader: renderShader,
+      attributes: [{ name: "aData", size: 4, stride: 16, offset: 0 }],
+      depthTest: false, blend: true,
+    });
+
+    const cmd = device.createCommandBuffer();
+    const pointer = [0, 0];
+    let flip = 0;
+    let running = true;
+    let raf = 0;
+    let last = performance.now();
+
+    const resize = () => {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      device.resize(Math.max(1, Math.round(canvas.clientWidth * dpr)), Math.max(1, Math.round(canvas.clientHeight * dpr)));
+    };
+    resize();
+    if (window.ResizeObserver) new window.ResizeObserver(resize).observe(canvas);
+    else window.addEventListener("resize", resize);
+
+    const onPointer = (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      const y = 1 - ((e.clientY - rect.top) / rect.height) * 2;
+      pointer[0] = x; pointer[1] = y;
+    };
+    window.addEventListener("pointermove", onPointer, { passive: true });
+
+    const frame = (now) => {
+      if (!running) return;
+      const dt = Math.min((now - last) / 1000, 0.05);
+      last = now;
+      const src = buffers[flip];
+      const dst = buffers[1 - flip];
+
+      // Вычислительный проход: обновление частиц на GPU через Transform Feedback.
+      cmd.begin();
+      const compute = device.createComputePass(cmd);
+      compute.setPipeline(computePipeline).setVertexBuffer(src, 0);
+      compute.setUniform("uDt", reduceMotion ? 0 : dt);
+      compute.setUniform("uTime", now / 1000);
+      compute.setUniform("uPointer", pointer);
+      compute.dispatch({ vertices: COUNT, bindings: [dst] });
+      compute.end();
+      cmd.submit();
+
+      // Render-проход: точки-частицы с мягким свечением.
+      cmd.begin();
+      const render = device.createRenderPass(cmd, { clear: { r: 0, g: 0, b: 0, a: 0 } });
+      render.setPipeline(renderPipeline).setVertexBuffer(dst, 0);
+      render.setUniform("uRes", [gl.drawingBufferWidth, gl.drawingBufferHeight]);
+      render.draw({ count: COUNT });
+      render.end();
+      cmd.submit();
+
+      flip = 1 - flip;
+      raf = requestAnimationFrame(frame);
+    };
+    raf = requestAnimationFrame(frame);
+
+    return {
+      backend: "webgl2",
+      f16: false,
+      stop() {
+        running = false;
+        cancelAnimationFrame(raf);
+        computePipeline.destroy();
+        renderPipeline.destroy();
+        buffers.forEach((b) => b.destroy());
+        device.destroy();
+      },
+    };
+  }
+
+  /* ==========================================================================
+     ЧАСТЬ 3. Сцена для WebGPU (WGSL): compute-проход + render bundle.
+     ========================================================================== */
+
+  const WGSL = (f16) => `
+${f16 ? "enable f16;" : ""}
+struct Particle { pos: vec2${f16 ? "<f16>" : "<f32>"}, vel: vec2${f16 ? "<f16>" : "<f32>"} };
+struct Params { dt: f32, time: f32, pointer: vec2<f32>, res: vec2<f32>, count: u32, _pad: u32 };
+
+@group(0) @binding(0) var<storage, read>  src: array<Particle>;
+@group(0) @binding(1) var<storage, read_write> dst: array<Particle>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size(64)
+fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= params.count) { return; }
+  var p = src[gid.x];
+  let pos = vec2<f32>(p.pos);
+  let vel = vec2<f32>(p.vel);
+  let toC = -pos;
+  let d = length(pos) + 0.0001;
+  var acc = toC * (0.32 / (d * 0.4 + 0.35));
+  acc += vec2<f32>(-pos.y, pos.x) * 0.4;
+  acc += vec2<f32>(sin(params.time * 0.7 + pos.x * 3.1), cos(params.time * 0.6 + pos.y * 2.9)) * 0.1;
+  let toM = params.pointer - pos;
+  let md = length(toM) + 0.0001;
+  acc += normalize(toM) * (0.5 / (md * 0.06 + 1.0));
+  var v = (vel + acc * params.dt) * 0.985;
+  var np = pos + v * params.dt;
+  if (np.x > 1.3) { np.x = -1.3; } if (np.x < -1.3) { np.x = 1.3; }
+  if (np.y > 1.3) { np.y = -1.3; } if (np.y < -1.3) { np.y = 1.3; }
+  p.pos = vec2${f16 ? "<f16>" : "<f32>"}(np);
+  p.vel = vec2${f16 ? "<f16>" : "<f32>"}(v);
+  dst[gid.x] = p;
+}
+
+struct VertexOut {
+  @builtin(position) position: vec4<f32>,
+  @location(0) speed: f32,
+  @location(1) depth: f32,
+  @location(2) corner: vec2<f32>,
+};
+
+@group(0) @binding(0) var<storage, read> render_src: array<Particle>;
+@group(0) @binding(2) var<uniform> render_params: Params;
+
+// Инстансированный квад: 4 вершины по vertex_index + одна частица на инстанс.
+@vertex
+fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) instance: u32) -> VertexOut {
+  var corners = array<vec2<f32>, 4>(vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, 1.0));
+  let corner = corners[vid];
+  let p = render_src[instance];
+  let pos = vec2<f32>(p.pos);
+  let vel = vec2<f32>(p.vel);
+  let speed = length(vel);
+  let aspect = render_params.res.x / max(render_params.res.y, 1.0);
+  let size = 0.006 + speed * 0.005;
+  let world = pos + corner * size;
+  var out: VertexOut;
+  out.position = vec4<f32>(world.x / max(aspect, 0.1), world.y, 0.0, 1.0);
+  out.speed = speed;
+  out.depth = clamp((1.25 - length(pos)) * 0.85, 0.0, 1.0);
+  out.corner = corner;
+  return out;
+}
+
+@fragment
+fn fs(in: VertexOut) -> @location(0) vec4<f32> {
+  let r = length(in.corner);
+  if (r > 1.0) { discard; }
+  let glow = 1.0 - r;
+  let cool = vec3<f32>(0.15, 0.45, 1.0);
+  let warm = vec3<f32>(0.85, 0.35, 0.95);
+  let color = mix(cool, warm, clamp(in.speed * 0.8, 0.0, 1.0));
+  return vec4<f32>(color, glow * glow * (0.28 + in.depth * 0.35) * 0.55);
+}`;
+
+  async function runWebGPU(canvas) {
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "low-power" });
+    if (!adapter) throw new Error("no adapter");
+    // Проверка shader-f16: при поддержке частицы хранятся в f16 — экономия памяти.
+    const f16 = adapter.features.has("shader-f16");
+    const device = await adapter.requestDevice(f16 ? { requiredFeatures: ["shader-f16"] } : undefined);
+    const ctx = canvas.getContext("webgpu");
+    if (!ctx) throw new Error("no context");
+    const format = navigator.gpu.getPreferredCanvasFormat();
+
+    const seeded = seedParticles();
+    let packed;
+    if (f16) {
+      packed = new Uint16Array(COUNT * 4);
+      const toF16 = (value) => {
+        const buf = new DataView(new ArrayBuffer(4));
+        buf.setFloat32(0, value);
+        const x = buf.getUint32(0);
+        const sign = (x >> 16) & 0x8000;
+        const exp = (x >> 23) & 0xff;
+        const mant = x & 0x7fffff;
+        if (exp === 255) return sign | 0x7c00;
+        if (exp > 142) return sign | 0x7bff;
+        if (exp < 127) return sign;
+        return sign | ((exp - 127) << 10) | (mant >> 13);
+      };
+      for (let i = 0; i < COUNT * 4; i += 1) packed[i] = toF16(seeded[i]);
+    } else packed = seeded;
+
+    const module = device.createShaderModule({ code: WGSL(f16) });
+    // Один uniform-буфер на всё: 8 слотов — dt, time, pointer(2), res(2), count, pad.
+    const paramsBuffer = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const paramsData = new Float32Array(8);
+    const paramsUint = new Uint32Array(paramsData.buffer);
+
+    const srcBuffer = device.createBuffer({ size: packed.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const dstBuffer = device.createBuffer({ size: packed.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(srcBuffer, 0, packed);
+
+    // Compute-пайплайн: layout «auto» — раскладка выводится из шейдера.
+    const computePipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "update" } });
+    const bindGroup = device.createBindGroup({
+      layout: computePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: srcBuffer } },
+        { binding: 1, resource: { buffer: dstBuffer } },
+        { binding: 2, resource: { buffer: paramsBuffer } },
+      ],
+    });
+
+    // Render-пайплайн: инстансированные квады с аддитивным свечением.
+    const renderPipeline = device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module, entryPoint: "vs" },
+      fragment: {
+        module,
+        entryPoint: "fs",
+        targets: [{
+          format,
+          blend: {
+            color: { srcFactor: "src-alpha", dstFactor: "one", operation: "add" },
+            alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
+          },
+        }],
+      },
+      primitive: { topology: "triangle-strip" },
+    });
+    const renderBindGroup = device.createBindGroup({
+      layout: renderPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: srcBuffer } },
+        { binding: 2, resource: { buffer: paramsBuffer } },
+      ],
+    });
+
+    // Render Bundle (в Metal — indirect command buffer): сцена записана один раз
+    // и переигрывается каждый кадр без повторной записи draw-вызовов.
+    const bundleEncoder = device.createRenderBundleEncoder({ colorFormats: [format] });
+    bundleEncoder.setPipeline(renderPipeline);
+    bundleEncoder.setBindGroup(0, renderBindGroup);
+    bundleEncoder.draw(4, COUNT, 0, 0);
+    const bundle = bundleEncoder.finish();
+
+    let running = true;
+    const pointer = [0, 0];
+
+    const resize = () => {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = Math.max(1, Math.round(canvas.clientWidth * dpr));
+      canvas.height = Math.max(1, Math.round(canvas.clientHeight * dpr));
+      ctx.configure({ device, format, alphaMode: "premultiplied" });
+    };
+    resize();
+    if (window.ResizeObserver) new window.ResizeObserver(resize).observe(canvas);
+    else window.addEventListener("resize", resize);
+
+    window.addEventListener("pointermove", (e) => {
+      const rect = canvas.getBoundingClientRect();
+      pointer[0] = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer[1] = 1 - ((e.clientY - rect.top) / rect.height) * 2;
+    }, { passive: true });
+
+    let last = performance.now();
+
+    const frame = (now) => {
+      if (!running) return;
+      const dt = Math.min((now - last) / 1000, 0.05);
+      last = now;
+      paramsData[0] = reduceMotion ? 0 : dt;
+      paramsData[1] = now / 1000;
+      paramsData[2] = pointer[0];
+      paramsData[3] = pointer[1];
+      paramsData[4] = canvas.width;
+      paramsData[5] = canvas.height;
+      paramsUint[6] = COUNT;
+
+      // Единственное обновление буфера за кадр — uniform-блок целиком.
+      device.queue.writeBuffer(paramsBuffer, 0, paramsData);
+
+      const encoder = device.createCommandEncoder();
+
+      // Compute: обновление частиц.
+      const computePass = encoder.beginComputePass();
+      computePass.setPipeline(computePipeline);
+      computePass.setBindGroup(0, bindGroup);
+      computePass.dispatchWorkgroups(Math.ceil(COUNT / 64));
+      computePass.end();
+
+      // Ping-pong: результат вычислений становится источником для рендера
+      // копированием в читаемый буфер — новые буферы не создаются.
+      encoder.copyBufferToBuffer(dstBuffer, 0, srcBuffer, 0, packed.byteLength);
+
+      // Render: переигрываем записанный bundle.
+      const pass = encoder.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" }] });
+      pass.executeBundles([bundle]);
+      pass.end();
+
+      device.queue.submit([encoder.finish()]);
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+
+    return {
+      backend: "webgpu",
+      f16,
+      stop() {
+        running = false;
+        srcBuffer.destroy();
+        dstBuffer.destroy();
+        paramsBuffer.destroy();
+        device.destroy();
+      },
+    };
+  }
+
+  /* ==========================================================================
+     ЧАСТЬ 4. Публичный API движка.
+     ========================================================================== */
+
+  window.Lightning = {
+    // Создаёт движок для canvas: WebGPU (Metal) → WebGL 2.0 → ничего.
+    async create(canvas) {
+      if (!canvas) return null;
+      try {
+        if (navigator.gpu) {
+          const engine = await runWebGPU(canvas);
+          return engine;
+        }
+      } catch (e) {
+        // WebGPU не поднялся — переходим к WebGL 2.0.
+        console.warn("[Lightning] WebGPU недоступен, переключаюсь на WebGL 2.0:", e.message);
+      }
+      try {
+        return runWebGL2(canvas);
+      } catch (e) {
+        console.warn("[Lightning] WebGL 2.0 тоже недоступен, фон отключён:", e.message);
+        canvas.hidden = true;
+        return null;
+      }
+    },
+  };
+})();
+
+/* ==================== [21/25] assets/js/app.js ==================== */
+
+/* ============================================================================
+   Siri AI — браузерная часть. Новый интерфейс в стиле ChatGPT:
+   режимы AI Group / Siri / Smith, ответы по имени, интернет-поиск,
+   медленный стриминг как у GPT, кнопка «вниз», режим Live, кнопка «Ответить»
+   вместо жестов смахивания.
+   ============================================================================ */
+
+(() => {
+  "use strict";
+
+  const $ = (id) => document.getElementById(id);
+  const chatEl = $("chat");
+  const messagesEl = $("messages");
+  const welcomeEl = $("welcome");
+  const listEl = $("chatList");
+  const inputEl = $("input");
+  const sendBtn = $("send");
+  const toastEl = $("toast");
+  const jumpDown = $("jumpDown");
+  const replyChip = $("replyChip");
+  const replyText = $("replyText");
+
+  if (!chatEl) return;
+
+  const PERSONAS = {
+    siri: { name: "Siri", emoji: "🧠" },
+    smith: { name: "Smith", emoji: "🎩" },
+  };
+  const MODES = ["siri", "smith", "group"];
+  const SPEEDS = { slow: 14, medium: 34, fast: 95 }; // символов в секунду
+
+  const state = {
+    chats: [],
+    chatId: null,
+    mode: "siri",
+    model: "cyclone",
+    context: "1m",
+    speed: "slow",
+    sending: false,
+    filter: "",
+    replyTo: null, // { who, text }
+    lightning: true,
+    live: false,
+  };
+  let toastTimer = 0;
+  let streamAbort = null;
+
+  // Safari в приватном режиме может запрещать localStorage — приложение работает и так.
+  const store = {
+    get(key) {
+      try { return localStorage.getItem(key) || ""; } catch { return ""; }
+    },
+    set(key, value) {
+      try { localStorage.setItem(key, value); } catch { /* хранилище заблокировано */ }
+    },
+  };
+
+  function toast(text) {
+    toastEl.textContent = text;
+    toastEl.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toastEl.hidden = true; }, 3400);
+  }
+
+  /* ---------- прокрутка и кнопка «вниз» ---------- */
+  let scrollQueued = false;
+  function distanceFromBottom() {
+    return chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight;
+  }
+  function nearBottom() {
+    return distanceFromBottom() < 200;
+  }
+  function scrollDown(force = true) {
+    if (!force && !nearBottom()) return;
+    if (scrollQueued) return;
+    scrollQueued = true;
+    requestAnimationFrame(() => {
+      scrollQueued = false;
+      chatEl.scrollTop = chatEl.scrollHeight;
+    });
+  }
+  function updateJumpDown() {
+    const show = distanceFromBottom() > 420;
+    jumpDown.classList.toggle("show", show);
+    jumpDown.hidden = !show; // глобальное [hidden]{display:none!important} перебивает класс .show
+  }
+  chatEl.addEventListener("scroll", updateJumpDown, { passive: true });
+  jumpDown.addEventListener("click", () => {
+    chatEl.scrollTo({ top: chatEl.scrollHeight, behavior: "smooth" });
+  });
+
+  /* ---------- режим: AI Group / Siri / Smith ---------- */
+  function setMode(mode, announce) {
+    state.mode = MODES.includes(mode) ? mode : "siri";
+    store.set("siri-mode", state.mode);
+    document.querySelectorAll(".mode-btn").forEach((btn) => {
+      btn.setAttribute("aria-selected", String(btn.dataset.mode === state.mode));
+    });
+    if (announce) {
+      const labels = { siri: "Siri", smith: "Smith", group: "AI Group (Siri + Smith)" };
+      toast("Режим: " + labels[state.mode]);
+    }
+  }
+  document.querySelectorAll(".mode-btn").forEach((btn) => {
+    btn.addEventListener("click", () => setMode(btn.dataset.mode, true));
+  });
+
+  /* ---------- боковое меню ---------- */
+  const sidebar = $("sidebar");
+  const scrim = $("scrim");
+  function openSidebar(focusSearch) {
+    sidebar.classList.add("open");
+    scrim.hidden = false;
+    if (focusSearch) setTimeout(() => $("chatSearch").focus(), 180);
+  }
+  function closeSidebar() {
+    sidebar.classList.remove("open");
+    scrim.hidden = true;
+  }
+  $("openSidebar").addEventListener("click", () => openSidebar(false));
+  $("closeSidebar").addEventListener("click", closeSidebar);
+  $("searchBtn").addEventListener("click", () => openSidebar(true));
+  scrim.addEventListener("click", closeSidebar);
+
+  const modal = $("settingsModal");
+  function openModal() { modal.hidden = false; loadSettingsIntoModal(); }
+  function closeModal() { modal.hidden = true; }
+  $("settingsBtn").addEventListener("click", openModal);
+  $("settingsClose").addEventListener("click", closeModal);
+  modal.addEventListener("click", (e) => { if (e.target === modal) closeModal(); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (!modal.hidden) closeModal();
+    else if (sidebar.classList.contains("open")) closeSidebar();
+  });
+
+  /* ---------- тема и размер текста ---------- */
+  const themeSwitch = $("themeSwitch");
+  const fontSwitch = $("fontSwitch");
+  function applyTheme(light) {
+    document.documentElement.dataset.theme = light ? "light" : "dark";
+    themeSwitch.checked = light;
+    store.set("siri-theme", light ? "light" : "dark");
+  }
+  function applyFont(large) {
+    document.documentElement.dataset.fontSize = large ? "large" : "normal";
+    fontSwitch.checked = large;
+    store.set("siri-font", large ? "large" : "normal");
+  }
+  applyTheme(store.get("siri-theme") === "light");
+  applyFont(store.get("siri-font") === "large");
+  themeSwitch.addEventListener("change", () => applyTheme(themeSwitch.checked));
+  fontSwitch.addEventListener("change", () => applyFont(fontSwitch.checked));
+  $("themeBtn").addEventListener("click", () => applyTheme(!themeSwitch.checked));
+
+  /* ---------- движок Lightning ---------- */
+  let lightningEngine = null;
+  async function applyLightning(on) {
+    state.lightning = on !== false;
+    const canvas = $("bgCanvas");
+    if (!canvas) return;
+    if (!state.lightning) {
+      if (lightningEngine) { lightningEngine.stop(); lightningEngine = null; }
+      canvas.hidden = true;
+      return;
+    }
+    canvas.hidden = false;
+    if (!lightningEngine && window.Lightning) {
+      lightningEngine = await window.Lightning.create(canvas);
+    }
+  }
+
+  /* ---------- модель (теперь в настройках) ---------- */
+  const modelSelect = $("modelSelect");
+  const modelPill = $("modelPill");
+  const contextSelect = $("contextSelect");
+  const speedSelect = $("speedSelect");
+
+  function applyModel(key) {
+    state.model = key;
+    store.set("siri-model", key);
+    if (modelSelect) modelSelect.value = key;
+    const option = modelSelect ? modelSelect.options[modelSelect.selectedIndex] : null;
+    if (modelPill) modelPill.textContent = option ? option.textContent.replace(/^Siri\s*/, "").replace(/\s*\(\d+B\)$/, "") : "6.0 Cyclone";
+  }
+
+  /* ---------- загрузка и сохранение настроек ---------- */
+  async function loadSettingsIntoModal() {
+    try {
+      const res = await fetch("/api/settings", { headers: { accept: "application/json" } });
+      if (!res.ok) return;
+      const data = await res.json();
+      state.model = data.model || "cyclone";
+      state.context = data.context || "1m";
+      state.speed = data.stream_speed || "slow";
+      applyModel(state.model);
+      if (contextSelect) contextSelect.value = state.context;
+      if (speedSelect) speedSelect.value = state.speed;
+      if (data.bio !== undefined && $("bioText")) $("bioText").value = data.bio;
+      if ($("lightningSwitch")) $("lightningSwitch").checked = data.lightning !== false;
+      if ($("shieldSwitch")) $("shieldSwitch").checked = !!data.shield;
+    } catch { /* настройки не критичны */ }
+  }
+
+  async function saveSettings(patch) {
+    const res = await fetch("/api/settings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    if (!res.ok) throw new Error("failed");
+    return res.json();
+  }
+
+  if (modelSelect) modelSelect.addEventListener("change", async () => {
+    applyModel(modelSelect.value);
+    try { await saveSettings({ model: state.model }); toast("Модель: " + modelSelect.options[modelSelect.selectedIndex].text); }
+    catch { toast("Не удалось сохранить модель"); }
+  });
+  if (contextSelect) contextSelect.addEventListener("change", async () => {
+    state.context = contextSelect.value;
+    try { await saveSettings({ context: state.context }); toast("Контекст: " + contextSelect.options[contextSelect.selectedIndex].text); }
+    catch { toast("Не удалось сохранить контекст"); }
+  });
+  if (speedSelect) speedSelect.addEventListener("change", async () => {
+    state.speed = speedSelect.value;
+    store.set("siri-speed", state.speed);
+    try { await saveSettings({ stream_speed: state.speed }); } catch { /* локально тоже работает */ }
+    toast("Скорость печати: " + speedSelect.options[speedSelect.selectedIndex].text);
+  });
+  if ($("lightningSwitch")) $("lightningSwitch").addEventListener("change", async (e) => {
+    await applyLightning(e.target.checked);
+    try { await saveSettings({ lightning: e.target.checked }); } catch { /* локально тоже работает */ }
+  });
+  if ($("bioSave")) $("bioSave").addEventListener("click", async () => {
+    const bio = $("bioText").value.trim();
+    try {
+      await saveSettings({ bio });
+      toast("Персональная память сохранена — Siri и Смит теперь знают о вас больше");
+    } catch { toast("Не удалось сохранить память. Попробуйте ещё раз."); }
+  });
+
+  /* ---------- защита ---------- */
+  const shieldSwitch = $("shieldSwitch");
+  const shieldStatus = $("shieldStatus");
+  const DEFAULT_SHIELD_TEXT =
+    "Проверяет сообщения на вредоносный код, взлом запросов и перегрузку. При включении подозрительные сообщения блокируются, а нарушитель — на 15 минут.";
+  function showShield(data) {
+    shieldSwitch.checked = !!data.shield;
+    if (!data.shield) { shieldStatus.textContent = DEFAULT_SHIELD_TEXT; return; }
+    if (data.blocked_until) {
+      const mins = Math.ceil((data.blocked_until - Date.now()) / 60000);
+      shieldStatus.textContent = "Активен. Отправка заблокирована ещё на " + mins + " мин. после подозрительных сообщений.";
+    } else if (data.strikes) {
+      shieldStatus.textContent = "Активен. Замечено подозрительных сообщений: " + data.strikes + " из 3 до блокировки.";
+    } else {
+      shieldStatus.textContent = "Активен: перегрузка и вредоносный код блокируются на сервере.";
+    }
+  }
+  shieldSwitch.addEventListener("change", async () => {
+    shieldSwitch.disabled = true;
+    try {
+      const data = await saveSettings({ shield: shieldSwitch.checked });
+      showShield(data);
+      toast(data.shield ? "Режим защиты включён" : "Режим защиты выключен");
+    } catch {
+      shieldSwitch.checked = !shieldSwitch.checked;
+      toast("Не удалось изменить режим защиты. Попробуй ещё раз.");
+    } finally {
+      shieldSwitch.disabled = false;
+    }
+  });
+
+  /* ---------- список чатов ---------- */
+  const MODE_TAGS = { siri: "S", smith: "См", group: "Group" };
+  function renderChats() {
+    listEl.replaceChildren();
+    const items = state.chats.filter((ch) =>
+      !state.filter || (ch.title + " " + (ch.preview || "")).toLowerCase().includes(state.filter)
+    );
+    if (!items.length) {
+      const p = document.createElement("p");
+      p.className = "chat-empty";
+      p.textContent = state.filter ? "Ничего не найдено." : "Пока нет чатов. Напиши первое сообщение.";
+      listEl.append(p);
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (const ch of items) {
+      const row = document.createElement("div");
+      row.className = "chat-item" + (ch.id === state.chatId ? " active" : "");
+
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "chat-open";
+      const title = document.createElement("span");
+      title.className = "chat-title";
+      const tag = document.createElement("span");
+      tag.className = "chat-mode-tag " + (ch.mode || "siri");
+      tag.textContent = (MODE_TAGS[ch.mode] || "S") + " · ";
+      title.append(tag, document.createTextNode(ch.title));
+      const preview = document.createElement("span");
+      preview.className = "chat-preview";
+      preview.textContent = ch.preview || "Пустой чат";
+      open.append(title, preview);
+      open.addEventListener("click", () => selectChat(ch.id));
+
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.className = "chat-action";
+      rename.setAttribute("aria-label", "Переименовать чат");
+      rename.title = "Переименовать";
+      rename.textContent = "✎";
+      rename.addEventListener("click", () => renameChat(ch));
+
+      const exportBtn = document.createElement("button");
+      exportBtn.type = "button";
+      exportBtn.className = "chat-action";
+      exportBtn.setAttribute("aria-label", "Экспортировать чат");
+      exportBtn.title = "Экспорт в Markdown";
+      exportBtn.textContent = "⤓";
+      exportBtn.addEventListener("click", () => exportChat(ch));
+
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "chat-delete";
+      del.setAttribute("aria-label", "Удалить чат");
+      del.textContent = "✕";
+      del.addEventListener("click", () => deleteChat(ch.id));
+
+      row.append(open, rename, exportBtn, del);
+      frag.append(row);
+    }
+    listEl.append(frag);
+  }
+
+  async function loadChats() {
+    try {
+      const res = await fetch("/api/chats", { headers: { accept: "application/json" } });
+      if (!res.ok) throw new Error("failed");
+      const data = await res.json();
+      state.chats = data.chats || [];
+      renderChats();
+      return true;
+    } catch {
+      listEl.replaceChildren();
+      const p = document.createElement("p");
+      p.className = "chat-empty";
+      p.textContent = "Не удалось загрузить чаты. Обнови страницу.";
+      listEl.append(p);
+      return false;
+    }
+  }
+
+  function resetView() {
+    abortStream();
+    state.chatId = null;
+    state.replyTo = null;
+    updateReplyChip();
+    messagesEl.replaceChildren();
+    welcomeEl.hidden = false;
+    renderChats();
+    closeSidebar();
+    inputEl.focus();
+  }
+
+  async function selectChat(id) {
+    if (state.chatId === id) { closeSidebar(); return; }
+    abortStream();
+    try {
+      const res = await fetch(`/api/chats/${id}`, { headers: { accept: "application/json" } });
+      if (!res.ok) throw new Error("failed");
+      const data = await res.json();
+      state.chatId = data.chat.id;
+      setMode(data.chat.mode || "siri", false);
+      messagesEl.replaceChildren();
+      welcomeEl.hidden = true;
+      (data.messages || []).forEach((m) => appendMessage(m));
+      renderChats();
+      closeSidebar();
+      scrollDown();
+      updateJumpDown();
+    } catch {
+      toast("Не удалось открыть чат. Попробуй ещё раз.");
+    }
+  }
+
+  async function deleteChat(id) {
+    if (!confirm("Удалить этот чат из облака? Действие необратимо.")) return;
+    try {
+      const res = await fetch(`/api/chats/${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("failed");
+      state.chats = state.chats.filter((ch) => ch.id !== id);
+      if (state.chatId === id) resetView();
+      else renderChats();
+      toast("Чат удалён");
+    } catch {
+      toast("Не удалось удалить чат. Попробуй ещё раз.");
+    }
+  }
+
+  async function renameChat(chat) {
+    const next = window.prompt("Новое название чата", chat.title);
+    if (next === null) return;
+    const title = next.replace(/\s+/g, " ").trim();
+    if (!title) return toast("Название не может быть пустым.");
+    try {
+      const res = await fetch(`/api/chats/${chat.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title }),
+      });
+      if (!res.ok) throw new Error("failed");
+      chat.title = title;
+      renderChats();
+      toast("Чат переименован");
+    } catch {
+      toast("Не удалось переименовать чат. Попробуй ещё раз.");
+    }
+  }
+
+  function exportChat(chat) {
+    const link = document.createElement("a");
+    link.href = "/api/chats/" + chat.id + "/export";
+    link.download = chat.title + ".md";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    toast("Экспорт чата начался");
+  }
+
+  /* ---------- сообщения ---------- */
+  function updateReplyChip() {
+    if (!state.replyTo) { replyChip.hidden = true; return; }
+    const persona = PERSONAS[state.replyTo.who];
+    replyText.textContent = "Ответить " + (persona ? persona.name : "") + ": «" + state.replyTo.text.slice(0, 80) + "»";
+    replyChip.hidden = false;
+  }
+  $("replyCancel").addEventListener("click", () => {
+    state.replyTo = null;
+    updateReplyChip();
+  });
+
+  function addActions(bubbleWrap, msg) {
+    const actions = document.createElement("div");
+    actions.className = "msg-actions";
+
+    if (msg.id) {
+      const rate = (value) => {
+        fetch(`/api/messages/${msg.id}/feedback`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ rating: value }),
+        })
+          .then((res) => {
+            if (!res.ok) throw new Error("failed");
+            up.classList.toggle("active", value === "up");
+            down.classList.toggle("active", value === "down");
+            toast(value === "up" ? "Спасибо! Siri будет отвечать так же" : "Siri запомнит, что так не надо");
+          })
+          .catch(() => toast("Не удалось сохранить оценку. Попробуй ещё раз."));
+      };
+      const up = document.createElement("button");
+      up.type = "button";
+      up.className = "rate-btn" + (msg.rating === "up" ? " active" : "");
+      up.textContent = "👍";
+      up.title = "Хороший ответ";
+      up.addEventListener("click", () => rate("up"));
+      const down = document.createElement("button");
+      down.type = "button";
+      down.className = "rate-btn" + (msg.rating === "down" ? " active" : "");
+      down.textContent = "👎";
+      down.title = "Плохой ответ";
+      down.addEventListener("click", () => rate("down"));
+      actions.append(up, down);
+    }
+
+    // Ответ на сообщение: кнопка вместо жеста смахивания.
+    const reply = document.createElement("button");
+    reply.type = "button";
+    reply.className = "reply-btn";
+    reply.textContent = "Ответить";
+    reply.addEventListener("click", () => {
+      state.replyTo = { who: msg.who || "siri", text: msg.text || "" };
+      updateReplyChip();
+      inputEl.focus();
+    });
+    actions.append(reply);
+
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.textContent = "Копировать";
+    copy.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(msg.text || "");
+        toast("Скопировано");
+      } catch { toast("Не удалось скопировать"); }
+    });
+
+    const speak = document.createElement("button");
+    speak.type = "button";
+    speak.textContent = "Озвучить";
+    speak.addEventListener("click", () => speakText(msg.text || ""));
+
+    actions.append(copy, speak);
+    bubbleWrap.append(actions);
+  }
+
+  function speakText(text) {
+    if (!("speechSynthesis" in window)) return toast("Озвучивание недоступно в этом браузере");
+    speechSynthesis.cancel();
+    const utter = new SpeechSynthesisUtterance(text.slice(0, 1000));
+    utter.lang = /[а-яё]/i.test(text) ? "ru-RU" : "en-US";
+    speechSynthesis.speak(utter);
+  }
+
+  function addSources(bubbleWrap, sources) {
+    if (!sources || !sources.length) return;
+    const box = document.createElement("div");
+    box.className = "sources";
+    sources.slice(0, 6).forEach((source) => {
+      const chip = document.createElement("a");
+      chip.className = "source-chip";
+      chip.href = source.url;
+      chip.target = "_blank";
+      chip.rel = "noopener";
+      const icon = document.createElement("span");
+      icon.textContent = "🔗";
+      const label = document.createElement("span");
+      label.textContent = source.title || source.url;
+      chip.append(icon, label);
+      box.append(chip);
+    });
+    bubbleWrap.append(box);
+  }
+
+  function appendMessage(msg) {
+    const role = msg.role === "ai" ? "ai" : "user";
+    const wrap = document.createElement("div");
+    wrap.className = "message " + role;
+
+    if (role === "ai") {
+      const who = msg.who || "siri";
+      const persona = PERSONAS[who] || PERSONAS.siri;
+      const avatar = document.createElement("div");
+      avatar.className = "avatar " + who;
+      avatar.textContent = persona.emoji;
+      wrap.append(avatar);
+    }
+
+    const bubbleWrap = document.createElement("div");
+    bubbleWrap.className = "bubble-wrap";
+    const head = document.createElement("div");
+    head.className = "msg-head";
+    if (role === "ai") {
+      const name = document.createElement("span");
+      name.className = "msg-name " + (msg.who || "siri");
+      name.textContent = (PERSONAS[msg.who] || PERSONAS.siri).name;
+      head.append(name);
+    }
+    bubbleWrap.append(head);
+
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.textContent = msg.text || "";
+    bubbleWrap.append(bubble);
+
+    if (role === "ai") {
+      addSources(bubbleWrap, msg.sources);
+      addActions(bubbleWrap, msg);
+    }
+
+    wrap.append(bubbleWrap);
+    messagesEl.append(wrap);
+    return wrap;
+  }
+
+  // Живое сообщение: три точки, которые превращаются в текст.
+  function liveMessage(who) {
+    const persona = PERSONAS[who] || PERSONAS.siri;
+    const wrap = document.createElement("div");
+    wrap.className = "message ai streaming";
+    const avatar = document.createElement("div");
+    avatar.className = "avatar " + who;
+    avatar.textContent = persona.emoji;
+    const bubbleWrap = document.createElement("div");
+    bubbleWrap.className = "bubble-wrap";
+    const head = document.createElement("div");
+    head.className = "msg-head";
+    const name = document.createElement("span");
+    name.className = "msg-name " + who;
+    name.textContent = persona.name;
+    head.append(name);
+    const bubble = document.createElement("div");
+    bubble.className = "bubble streaming" + (who === "smith" ? " smith-stream" : "");
+    const dots = document.createElement("span");
+    dots.className = "typing-dots";
+    for (let i = 0; i < 3; i += 1) dots.append(document.createElement("span"));
+    bubble.append(dots);
+    bubbleWrap.append(head, bubble);
+    wrap.append(avatar, bubbleWrap);
+    messagesEl.append(wrap);
+    scrollDown();
+    return { wrap, bubble, bubbleWrap, dots };
+  }
+
+  function finishLive(live, msg) {
+    if (live.done) return; // защита от двойного вызова (onDone + финальный цикл)
+    live.done = true;
+    live.bubble.classList.remove("streaming", "has-text", "smith-stream");
+    live.bubble.textContent = msg.text;
+    live.wrap.classList.remove("streaming");
+    addSources(live.bubbleWrap, msg.sources);
+    addActions(live.bubbleWrap, msg);
+  }
+
+  function appendSearchBanner(query) {
+    const banner = document.createElement("div");
+    banner.className = "search-banner";
+    banner.innerHTML =
+      '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>';
+    const text = document.createElement("span");
+    text.textContent = "Ищу в интернете: " + query + "…";
+    banner.append(text);
+    messagesEl.append(banner);
+    scrollDown();
+    return banner;
+  }
+
+  /* ---------- медленный стриминг ---------- */
+  // Краска текста: скорость из настроек (по умолчанию медленно, как у GPT).
+  const painters = new Set();
+  function paintLive(live, who, onDone) {
+    const painter = {
+      full: "",
+      shown: 0,
+      started: false,
+      finished: false,
+      last: performance.now(),
+      live,
+      onDone,
+    };
+    painters.add(painter);
+    if (painters.size === 1) requestAnimationFrame(paintLoop);
+  }
+
+  function paintLoop() {
+    const now = performance.now();
+    let active = false;
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    for (const painter of painters) {
+      active = true;
+      const dt = Math.min((now - painter.last) / 1000, 0.1);
+      painter.last = now;
+      const bubble = painter.live.bubble;
+      if (!painter.started && painter.full) {
+        painter.live.dots.remove();
+        bubble.textContent = "";
+        bubble.classList.add("has-text");
+        painter.started = true;
+      }
+      if (painter.started && painter.shown < painter.full.length) {
+        const cps = reduceMotion ? 600 : SPEEDS[state.speed] || SPEEDS.slow;
+        let step = cps * dt;
+        if (painter.finished) step = Math.max(step, (painter.full.length - painter.shown) * 0.4); // догоняем в конце
+        const next = Math.min(painter.full.length, painter.shown + Math.max(1, Math.floor(step)));
+        const chunk = painter.full.slice(painter.shown, next);
+        const last = bubble.lastChild;
+        if (last && last.nodeType === 3) last.nodeValue += chunk;
+        else bubble.append(document.createTextNode(chunk));
+        painter.shown = next;
+        scrollDown(false);
+      }
+      if (painter.finished && painter.shown >= painter.full.length) {
+        painters.delete(painter);
+        painter.onDone && painter.onDone();
+      }
+    }
+    if (active || painters.size) requestAnimationFrame(paintLoop);
+  }
+
+  /* ---------- режим Live (голос) ---------- */
+  const liveOverlay = $("liveOverlay");
+  const micBtn = $("micBtn");
+  const liveText = $("liveText");
+  const liveSwitch = $("liveSwitch");
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let recognition = null;
+  let liveOn = false;
+
+  function stopLive() {
+    liveOn = false;
+    if (recognition) { try { recognition.stop(); } catch { /* уже остановлен */ } recognition = null; }
+    liveOverlay.hidden = true;
+    micBtn.classList.remove("live-on");
+    if (liveSwitch) liveSwitch.checked = false;
+    if ("speechSynthesis" in window) speechSynthesis.cancel();
+    liveText.textContent = "Слушаю… говорите";
+  }
+
+  function startLive() {
+    if (!SR) {
+      toast("Голосовой ввод недоступен в этом браузере. На iPhone нужен iOS 14.5+ и Safari.");
+      return;
+    }
+    liveOn = true;
+    liveOverlay.hidden = false;
+    micBtn.classList.add("live-on");
+    if (liveSwitch) liveSwitch.checked = true;
+    try {
+      recognition = new SR();
+      recognition.lang = "ru-RU";
+      recognition.continuous = true;
+      recognition.interimResults = false;
+      recognition.onresult = (event) => {
+        for (let i = event.results.length - 1; i >= 0; i -= 1) {
+          const result = event.results[i];
+          if (result.isFinal) {
+            const text = result[0].transcript.trim();
+            if (text) {
+              liveText.textContent = text;
+              send(text);
+            }
+          }
+        }
+      };
+      recognition.onerror = () => { /* микрофон недоступен — просто ждём */ };
+      recognition.onend = () => {
+        // iOS останавливает распознавание после паузы: перезапускаем, пока режим активен.
+        if (liveOn) {
+          try { recognition.start(); } catch { stopLive(); }
+        }
+      };
+      recognition.start();
+    } catch {
+      stopLive();
+      toast("Не удалось включить микрофон. Разрешите доступ в настройках Safari.");
+    }
+  }
+
+  micBtn.addEventListener("click", () => (liveOn ? stopLive() : startLive()));
+  liveOverlay.addEventListener("click", stopLive);
+  if (liveSwitch) liveSwitch.addEventListener("change", (e) => (e.target.checked ? startLive() : stopLive()));
+
+  /* ---------- отправка ---------- */
+  function abortStream() {
+    if (!streamAbort) return;
+    const controller = streamAbort;
+    streamAbort = null;
+    controller.abort();
+    state.sending = false;
+    sendBtn.disabled = false;
+  }
+
+  async function send(text) {
+    const clean = (text || "").trim();
+    if (!clean || state.sending) return;
+    if (clean.length > 4000) return toast("Сообщение слишком длинное (максимум 4000 символов).");
+
+    state.sending = true;
+    sendBtn.disabled = true;
+    welcomeEl.hidden = true;
+
+    const optimistic = appendMessage({ role: "user", text: clean });
+    const replyQuote = state.replyTo ? state.replyTo.text : "";
+    state.replyTo = null;
+    updateReplyChip();
+    inputEl.value = "";
+    inputEl.style.height = "auto";
+    scrollDown();
+
+    const controller = new AbortController();
+    streamAbort = controller;
+
+    // Живые пузыри по персонам и их финальные тексты.
+    const lives = new Map(); // who → live
+    const finals = new Map(); // who → msg
+    let searchBanner = null;
+    let sawFirst = false;
+
+    const speakIfLive = (msg) => {
+      if (!liveOn || !("speechSynthesis" in window)) return;
+      const utter = new SpeechSynthesisUtterance(String(msg.text || "").slice(0, 800));
+      utter.lang = /[а-яё]/i.test(msg.text || "") ? "ru-RU" : "en-US";
+      speechSynthesis.speak(utter);
+    };
+
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "text/event-stream" },
+        body: JSON.stringify({
+          chat_id: state.chatId,
+          text: clean,
+          model: state.model,
+          mode: state.mode,
+          reply_to: replyQuote,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 403 && data.error === "shield_blocked") {
+          optimistic.remove();
+          const mins = data.retry_after ? Math.ceil(data.retry_after / 60) : 0;
+          toast(
+            mins
+              ? "Режим защиты заблокировал отправку: похоже на попытку взлома. Повтори через " + mins + " мин."
+              : "Режим защиты заблокировал это сообщение: похоже на вредоносный код или взлом."
+          );
+        } else if (res.status === 429) {
+          optimistic.remove();
+          toast(
+            data.error === "shield_rate_limited"
+              ? "Режим защиты: слишком много сообщений подряд. Подожди пару минут."
+              : "Слишком много сообщений за час. Немного отдохни и продолжи."
+          );
+        } else {
+          appendMessage({ role: "ai", who: "siri", text: "Облако сейчас не отвечает. Попробуй ещё раз через минуту." });
+        }
+        return;
+      }
+
+      setCloud(true);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const blocks = buffer.split(/\r?\n\r?\n/);
+        buffer = blocks.pop();
+        for (const block of blocks) {
+          const line = block.split("\n").find((l) => l.startsWith("data:"));
+          if (!line) continue;
+          let event;
+          try { event = JSON.parse(line.slice(5).trim()); } catch { continue; }
+
+          if (event.type === "start") {
+            if (!state.chatId) state.chatId = event.chat.id;
+            if (!state.chats.some((ch) => ch.id === event.chat.id)) {
+              state.chats.unshift({
+                id: event.chat.id,
+                title: event.chat.title,
+                preview: "",
+                mode: event.chat.mode,
+                updated_at: Date.now(),
+              });
+              renderChats();
+            }
+          } else if (event.type === "status") {
+            if (!searchBanner) searchBanner = appendSearchBanner(event.text);
+          } else if (event.type === "sources") {
+            if (searchBanner) {
+              searchBanner.textContent = "Нашёл в интернете: " + (event.query || "") + " — " + event.sources.length + " источн.";
+            }
+          } else if (event.type === "who") {
+            sawFirst = true;
+            const live = liveMessage(event.who);
+            lives.set(event.who, live);
+            paintLive(live, event.who, () => {
+              const final = finals.get(event.who);
+              if (final) {
+                finishLive(live, final);
+                speakIfLive(final);
+              }
+            });
+          } else if (event.type === "delta") {
+            const painter = [...painters].find((p) => p.live === lives.get(event.who));
+            if (painter) painter.full += event.text;
+          } else if (event.type === "saved") {
+            const painter = [...painters].find((p) => p.live === lives.get(event.who));
+            if (painter) painter.finished = true;
+            finals.set(event.who, event.reply);
+          } else if (event.type === "error") {
+            const live = lives.get(event.who);
+            const painter = [...painters].find((p) => p.live === live);
+            if (painter) painter.finished = true;
+            finals.set(event.who, {
+              text: event.error === "save_failed"
+                ? "Ответ пришёл, но сохранить его не удалось. Скопируй текст, если он нужен."
+                : "Облако сейчас не отвечает. Попробуй ещё раз через минуту.",
+              sources: [],
+            });
+            if (!live && !sawFirst) {
+              appendMessage({ role: "ai", who: event.who || "siri", text: "Облако сейчас не отвечает. Попробуй ещё раз через минуту." });
+            }
+          } else if (event.type === "done") {
+            for (const painter of painters) painter.finished = true;
+          }
+        }
+      }
+
+      // Всё, что не докрасилось, финализируем принудительно.
+      await new Promise((resolve) => {
+        const check = () => {
+          if (painters.size === 0) return resolve();
+          for (const painter of painters) painter.finished = true;
+          requestAnimationFrame(check);
+        };
+        check();
+      });
+      for (const [who, live] of lives) {
+        const final = finals.get(who);
+        if (final) finishLive(live, final);
+      }
+      if (!lives.size && !sawFirst) {
+        appendMessage({ role: "ai", who: "siri", text: "Облако сейчас не отвечает. Попробуй ещё раз через минуту." });
+      }
+      await loadChats();
+    } catch {
+      if (controller.signal.aborted) return;
+      setCloud(false);
+      appendMessage({ role: "ai", who: "siri", text: "Пропала связь с облаком. Проверь интернет и попробуй снова." });
+    } finally {
+      const current = streamAbort === controller;
+      if (current) streamAbort = null;
+      if (current || !streamAbort) {
+        state.sending = false;
+        sendBtn.disabled = false;
+        scrollDown(false);
+        updateJumpDown();
+        inputEl.focus();
+      }
+    }
+  }
+
+  function setCloud(ok) {
+    const el = $("cloudStatus");
+    if (!el) return;
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    if (!ok) dot.style.background = "var(--error)";
+    el.replaceChildren(dot, ok ? " в облаке" : " нет связи");
+  }
+
+  $("composer").addEventListener("submit", (e) => {
+    e.preventDefault();
+    send(inputEl.value);
+  });
+
+  inputEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      send(inputEl.value);
+    }
+  });
+
+  inputEl.addEventListener("input", () => {
+    inputEl.style.height = "auto";
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + "px";
+  });
+
+  $("newChat").addEventListener("click", resetView);
+  $("topNewChat").addEventListener("click", resetView);
+  $("chatSearch").addEventListener("input", (e) => {
+    state.filter = e.target.value.trim().toLowerCase();
+    renderChats();
+  });
+
+  document.querySelectorAll("[data-prompt]").forEach((btn) => {
+    btn.addEventListener("click", () => send(btn.dataset.prompt));
+  });
+
+  /* ---------- плюс: быстрый поиск в интернете ---------- */
+  $("plusBtn").addEventListener("click", () => {
+    inputEl.value = "Поищи в интернете: " + inputEl.value;
+    inputEl.focus();
+  });
+
+  /* ---------- запуск ---------- */
+  setMode(store.get("siri-mode") || "siri", false);
+  applyModel(store.get("siri-model") || "cyclone");
+  state.speed = store.get("siri-speed") || "slow";
+  if (speedSelect) speedSelect.value = state.speed;
+
+  const whenIdle = window.requestIdleCallback || ((fn) => setTimeout(fn, 700));
+  whenIdle(async () => {
+    await loadSettingsIntoModal();
+    await applyLightning($("lightningSwitch") ? $("lightningSwitch").checked : true);
+  });
+
+  (async () => {
+    await loadChats();
+    if (state.chats.length) selectChat(state.chats[0].id);
+    else if (window.matchMedia("(min-width: 900px)").matches) inputEl.focus();
+  })();
+})();
+
+/* ==================== [22/25] assets/js/source.js ==================== */
+
+
+(() => {
+  const holder = document.querySelector("[data-full]");
+  const showBtn = document.getElementById("sourceShow");
+  const copyBtn = document.getElementById("sourceCopy");
+  const status = document.getElementById("sourceStatus");
+  const pre = document.getElementById("sourceFull");
+  const codeEl = document.getElementById("sourceFullCode");
+  const url = holder ? holder.dataset.full : "";
+  if (!url || !showBtn || !copyBtn || !status || !pre || !codeEl) return;
+
+  let fullCode = null;
+  let loading = null;
+
+  function setStatus(text) {
+    status.textContent = text;
+    status.hidden = !text;
+  }
+
+  async function load() {
+    if (fullCode !== null) return fullCode;
+    if (loading) return loading;
+    setStatus("Загружаю весь код…");
+    loading = fetch(url, { headers: { accept: "text/plain" } })
+      .then((res) => {
+        if (!res.ok) throw new Error("failed");
+        return res.text();
+      })
+      .then((text) => {
+        fullCode = text;
+        setStatus("");
+        return text;
+      })
+      .catch(() => {
+        setStatus("Не удалось загрузить код. Откройте его в новой вкладке или скачайте файлом.");
+        throw new Error("failed");
+      })
+      .finally(() => {
+        loading = null;
+      });
+    return loading;
+  }
+
+  showBtn.addEventListener("click", async () => {
+    if (!pre.hidden) {
+      pre.hidden = true;
+      showBtn.textContent = "Показать весь код";
+      return;
+    }
+    showBtn.disabled = true;
+    try {
+      codeEl.textContent = await load();
+      pre.hidden = false;
+      showBtn.textContent = "Скрыть код";
+      const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      pre.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
+    } catch {
+      /* the status line explains what to do next */
+    } finally {
+      showBtn.disabled = false;
+    }
+  });
+
+  function legacyCopy(text) {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.append(area);
+    area.select();
+    const ok = document.execCommand("copy");
+    area.remove();
+    return ok;
+  }
+
+  copyBtn.addEventListener("click", async () => {
+    const label = copyBtn.textContent;
+    copyBtn.disabled = true;
+    try {
+      if (fullCode === null) await load();
+      try {
+        await navigator.clipboard.writeText(fullCode);
+      } catch {
+        if (!legacyCopy(fullCode)) throw new Error("failed");
+      }
+      copyBtn.textContent = "Скопировано ✓";
+    } catch {
+      copyBtn.textContent = "Не удалось — скачайте файлом";
+    }
+    setTimeout(() => {
+      copyBtn.textContent = label;
+      copyBtn.disabled = false;
+    }, 2400);
+  });
+
+  // Warm the code in the background so a tap copies instantly (iOS keeps the tap gesture only that way).
+  const idle = window.requestIdleCallback || ((fn) => setTimeout(fn, 1200));
+  idle(() => { load().catch(() => {}); });
+})();
+
+/* ==================== [23/25] assets/favicon.svg ==================== */
+
+
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Siri">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#141a3c"/>
+      <stop offset="1" stop-color="#07070f"/>
+    </linearGradient>
+    <linearGradient id="rainbow" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff3b30"/>
+      <stop offset="0.3" stop-color="#ffcc00"/>
+      <stop offset="0.55" stop-color="#34c759"/>
+      <stop offset="0.8" stop-color="#0a84ff"/>
+      <stop offset="1" stop-color="#ff2d92"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="url(#bg)"/>
+  <circle cx="32" cy="32" r="16" fill="none" stroke="url(#rainbow)" stroke-width="5" stroke-dasharray="78 22" stroke-linecap="round"/>
+  <circle cx="32" cy="32" r="7" fill="url(#rainbow)"/>
+  <circle cx="32" cy="10" r="2.6" fill="#fff"/>
+</svg>
+
+/* ==================== [24/25] assets/cover.svg ==================== */
+
+
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="576" viewBox="0 0 1024 576">
+  <defs>
+    <radialGradient id="glowA" cx="0.15" cy="0.1" r="0.7">
+      <stop offset="0" stop-color="#3b6bff" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#3b6bff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowB" cx="0.9" cy="0.05" r="0.6">
+      <stop offset="0" stop-color="#c04bff" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#c04bff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowC" cx="0.55" cy="1.15" r="0.75">
+      <stop offset="0" stop-color="#19c8d8" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#19c8d8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#080812"/>
+      <stop offset="0.5" stop-color="#101024"/>
+      <stop offset="1" stop-color="#070a12"/>
+    </linearGradient>
+    <linearGradient id="rainbow" x1="160" y1="0" x2="720" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff3b30"/>
+      <stop offset="0.18" stop-color="#ff9500"/>
+      <stop offset="0.35" stop-color="#ffcc00"/>
+      <stop offset="0.52" stop-color="#34c759"/>
+      <stop offset="0.7" stop-color="#00c7be"/>
+      <stop offset="0.84" stop-color="#0a84ff"/>
+      <stop offset="1" stop-color="#ff2d92"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="700" y1="130" x2="900" y2="420" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6f8dff" stop-opacity="0.85"/>
+      <stop offset="0.45" stop-color="#c04bff" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#19c8d8" stop-opacity="0.15"/>
+    </linearGradient>
+    <filter id="soft" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="14"/>
+    </filter>
+  </defs>
+
+  <rect width="1024" height="576" fill="url(#bg)"/>
+  <rect width="1024" height="576" fill="url(#glowA)"/>
+  <rect width="1024" height="576" fill="url(#glowB)"/>
+  <rect width="1024" height="576" fill="url(#glowC)"/>
+
+  <g opacity="0.14" stroke="#8fa4ff" stroke-width="1">
+    <path d="M0 120H1024M0 240H1024M0 360H1024M0 480H1024"/>
+    <path d="M120 0V576M240 0V576M360 0V576M480 0V576M600 0V576M720 0V576M840 0V576M960 0V576"/>
+  </g>
+
+  <!-- orbit -->
+  <g transform="translate(818 268)">
+    <circle r="150" fill="none" stroke="url(#ring)" stroke-width="2" opacity="0.7"/>
+    <circle r="106" fill="none" stroke="url(#ring)" stroke-width="1.2" opacity="0.45"/>
+    <circle r="62" fill="none" stroke="url(#ring)" stroke-width="1" opacity="0.35"/>
+    <circle r="150" fill="none" stroke="#cfe0ff" stroke-width="10" stroke-linecap="round" stroke-dasharray="40 900" opacity="0.8"/>
+    <circle r="106" fill="none" stroke="#ff9bdc" stroke-width="7" stroke-linecap="round" stroke-dasharray="20 640" opacity="0.7"/>
+    <circle cx="0" cy="0" r="66" fill="#0e1230" stroke="#5f7dff" stroke-width="2"/>
+    <circle cx="0" cy="0" r="48" fill="#1a2048"/>
+    <circle cx="0" cy="0" r="34" fill="#0d1030" stroke="#8b6bff" stroke-width="1.5"/>
+    <circle cx="0" cy="0" r="14" fill="#e9ecff"/>
+    <circle cx="0" cy="0" r="24" fill="#8b6bff" opacity="0.35" filter="url(#soft)"/>
+  </g>
+
+  <text x="88" y="128" font-family="sans-serif" font-size="20" letter-spacing="6" fill="#9fb3ff">ОБЛАЧНЫЙ ИИ</text>
+  <text x="88" y="272" font-family="sans-serif" font-size="140" font-weight="700" letter-spacing="-6" fill="url(#rainbow)">Siri</text>
+  <text x="88" y="338" font-family="sans-serif" font-size="34" font-weight="600" fill="#f4f6ff">теперь в облаке</text>
+  <text x="88" y="390" font-family="sans-serif" font-size="21" fill="#a9b2cf">Открыт для всех · без установки и регистрации</text>
+
+  <g transform="translate(88 452)">
+    <rect width="252" height="52" rx="26" fill="#141a35" stroke="#3f5bff" stroke-width="1.5"/>
+    <circle cx="30" cy="26" r="6" fill="#32d74b"/>
+    <text x="48" y="33" font-family="sans-serif" font-size="18" fill="#dfe5ff">онлайн для каждого</text>
+  </g>
+
+  <g transform="translate(750 96)">
+    <circle cx="0" cy="0" r="9" fill="#ffcc00"/>
+    <circle cx="0" cy="0" r="26" fill="#ffcc00" opacity="0.25" filter="url(#soft)"/>
+  </g>
+</svg>
+
+/* ==================== [25/25] scripts/bundle-source.mjs ==================== */
+
+// Builds the downloadable source artefacts:
+//   src/lib/full-code.js      — every server page, route, style and script in one connected string
+//   assets/siri-ai-source.zip — the same files as a project archive
+// Run from the app folder: node scripts/bundle-source.mjs
+import { execFileSync } from "node:child_process";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+// Reading order: entry point → pages and routes → helpers → styles → browser code → artwork.
+const FILES = [
+  "package.json",
+  "entry.mjs",
+  "src/index.js",
+  "src/layout.js",
+  "src/routes/pages.js",
+  "src/routes/api.js",
+  "src/routes/tools.js",
+  "src/routes/account.js",
+  "src/routes/source.js",
+  "src/lib/access.js",
+  "src/lib/auth.js",
+  "src/lib/cloud.js",
+  "src/lib/persona.js",
+  "src/lib/search.js",
+  "src/lib/security.js",
+  "src/lib/settings.js",
+  "src/lib/telegram.js",
+  "src/lib/visitor.js",
+  "assets/css/site.css",
+  "assets/js/lightning.js",
+  "assets/js/app.js",
+  "assets/js/source.js",
+  "assets/favicon.svg",
+  "assets/cover.svg",
+  "scripts/bundle-source.mjs",
+];
+
+const HEADER = `/* ============================================================================
+   SIRI AI CLOUD — ВЕСЬ ИСХОДНЫЙ КОД ОТ А ДО Я
+   Siri 6.0 Cyclone · Siri 7.0 Astra · Siri Super Coder · Siri 6.9 Vision
+   + Смит (AI Group) · интернет-поиск · режим Live · движок Lightning
+   Снимок: 5 ноября 2026
+
+   Здесь всё приложение целиком, по порядку и без разбивки на части:
+   точка входа → страницы и маршруты → работа с облаком, моделями,
+   поиском в интернете и защитой → оформление → браузерные скрипты → значки.
+
+   Каждый файл отмечен заголовком. Служебный модуль доступа к платформе
+   (src/pipe.js) выдаётся платформой и в этот файл не входит. Этот снимок
+   собирается скриптом в конце файла, он же создаёт страницу /source/full.
+   ============================================================================ */
+
+`;
+
+const SEPARATOR = (index, path) =>
+  `\n\n/* ==================== [${String(index).padStart(2, "0")}/${FILES.length}] ${path} ==================== */\n\n`;
+
+let combined = HEADER;
+FILES.forEach((path, i) => {
+  const code = readFileSync(join(ROOT, path), "utf8").replace(/\s+$/, "");
+  combined += SEPARATOR(i + 1, path) + code;
+});
+combined += "\n";
+
+writeFileSync(
+  join(ROOT, "src/lib/full-code.js"),
+  "// Generated by scripts/bundle-source.mjs — the whole app in one connected file. Do not edit by hand.\n" +
+    "export const FULL_CODE = " + JSON.stringify(combined) + ";\n",
+);
+
+const zipPath = join(ROOT, "assets/siri-ai-source.zip");
+rmSync(zipPath, { force: true });
+execFileSync("zip", ["-q", "-X", "assets/siri-ai-source.zip", ...FILES], { cwd: ROOT });
+
+const lines = combined.split("\n").length;
+console.log(`full code: ${FILES.length} files, ${lines} lines, ${combined.length} bytes`);
+console.log("archive: assets/siri-ai-source.zip, src/lib/full-code.js");
